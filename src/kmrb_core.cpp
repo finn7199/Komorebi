@@ -14,9 +14,18 @@ void Core::init() {
     createSwapchain();
     createImageViews();
 
+    // Initialize ECS — create particle entities
+    sim.init(registry, 10000);
+
     QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
+    renderer.setComputeShader(KMRB_SHADER_DIR "/gravity.comp");
     renderer.init(device, physicalDevice, swapchainImageFormat, swapchainExtent,
-                  swapchainImageViews, indices.graphicsFamily.value());
+                  swapchainImageViews, indices.graphicsFamily.value(),
+                  sim.getParticleCount());
+
+    // Sync ECS data to GPU — gather components into flat array, upload to SSBO
+    auto particles = sim.syncToSSBO(registry);
+    renderer.uploadParticles(device, particles);
 }
 
 void Core::initWindow() {

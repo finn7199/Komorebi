@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "kmrb_renderer.hpp"
+#include "kmrb_sim.hpp"
 
 namespace kmrb {
 
@@ -50,6 +51,10 @@ private:
 
     // ── Renderer ──
     Renderer renderer;
+
+    // ── ECS ──
+    entt::registry registry;
+    Simulation sim;
 
     // Device extensions we require
     const std::vector<const char*> deviceExtensions = {

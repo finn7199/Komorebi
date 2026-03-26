@@ -19,6 +19,10 @@ add_executable(Komorebi
     src/kmrb_core.hpp
     src/kmrb_renderer.cpp
     src/kmrb_renderer.hpp
+    src/kmrb_sim.cpp
+    src/kmrb_sim.hpp
+    src/kmrb_buffers.cpp
+    src/kmrb_buffers.hpp
     src/kmrb_types.hpp
 )
 
@@ -31,14 +35,20 @@ target_link_libraries(Komorebi PRIVATE
     EnTT::EnTT
 )
 
-# Vulkan SDK include path (for shaderc, spirv-reflect, spirv-cross headers)
+# Pass source paths to code so shaders can be found regardless of working directory
+target_compile_definitions(Komorebi PRIVATE
+    KMRB_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders"
+    KMRB_SHADER_SPV_DIR="${CMAKE_BINARY_DIR}/shaders"
+)
+
+# Vulkan SDK include path (for spirv-reflect, spirv-cross headers)
 target_include_directories(Komorebi PRIVATE
     "${VULKAN_SDK_PATH}/Include"
 )
 
-# Vulkan SDK libraries: shaderc (runtime compilation) + spirv-reflect (introspection)
+# Vulkan SDK libraries: spirv-reflect (introspection)
+# Note: shaderc is used via glslc subprocess, not linked directly (avoids Debug/Release mismatch)
 target_link_libraries(Komorebi PRIVATE
-    "${VULKAN_SDK_PATH}/Lib/shaderc_combined.lib"
     "${VULKAN_SDK_PATH}/Lib/spirv-reflect-static.lib"
 )
 

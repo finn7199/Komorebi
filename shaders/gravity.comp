@@ -1,0 +1,51 @@
+#version 450
+
+// Workgroup size — 256 threads is a good default for NVIDIA/AMD
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) uniform GlobalUBO {
+    mat4 view;
+    mat4 proj;
+    vec4 cameraPos;
+    float time;
+    float deltaTime;
+} global;
+
+struct Particle {
+    vec4 position;  // xyz = pos, w = point size
+    vec4 velocity;  // xyz = vel, w = lifetime
+    vec4 color;     // rgba
+};
+
+// Double-buffered: read from input, write to output
+// Prevents read-write hazards — no thread reads data another thread just wrote
+layout(set = 2, binding = 0) readonly buffer ParticleInput {
+    Particle particles[];
+} ssboIn;
+
+layout(set = 2, binding = 1) writeonly buffer ParticleOutput {
+    Particle particles[];
+} ssboOut;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= ssboIn.particles.length()) return;
+
+    Particle p = ssboIn.particles[index];
+
+    float dt = global.deltaTime;
+
+    // Gravity
+    p.velocity.y -= 9.8 * dt;
+
+    // Integrate position
+    p.position.xyz += p.velocity.xyz * dt;
+
+    // Floor bounce at y = -2
+    if (p.position.y < -2.0) {
+        p.position.y = -2.0;
+        p.velocity.y *= -0.7;
+    }
+
+    ssboOut.particles[index] = p;
+}

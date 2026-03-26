@@ -15,14 +15,15 @@ layout(push_constant) uniform PushConstants {
     vec4 color;
 } push;
 
-// Set 2: Particle SSBO — positions read by gl_VertexIndex
+// Set 2: Double-buffered particle SSBOs
 struct Particle {
     vec4 position;  // xyz = pos, w = point size
     vec4 velocity;  // xyz = vel, w = lifetime
     vec4 color;     // rgba
 };
 
-layout(set = 2, binding = 0) readonly buffer ParticleSSBO {
+// Binding 1 = output buffer (the one compute just wrote to this frame)
+layout(set = 2, binding = 1) readonly buffer ParticleSSBO {
     Particle particles[];
 } ssbo;
 
