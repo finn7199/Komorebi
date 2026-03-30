@@ -7,11 +7,24 @@ set(CMAKE_CXX_STANDARD 20)
 find_package(Vulkan REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
-find_package(imgui CONFIG REQUIRED)
 find_package(EnTT CONFIG REQUIRED)
 
 # Vulkan SDK ships shaderc and SPIRV tools — point CMake to them
 set(VULKAN_SDK_PATH "$ENV{VULKAN_SDK}")
+
+# ── Dear ImGui (vendored docking branch) ──
+set(IMGUI_DIR "${CMAKE_SOURCE_DIR}/external/imgui_docking")
+add_library(imgui STATIC
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_demo.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
+)
+target_include_directories(imgui PUBLIC ${IMGUI_DIR} ${IMGUI_DIR}/backends)
+target_link_libraries(imgui PUBLIC Vulkan::Vulkan glfw)
 
 add_executable(Komorebi
     src/main.cpp
@@ -23,6 +36,10 @@ add_executable(Komorebi
     src/kmrb_sim.hpp
     src/kmrb_buffers.cpp
     src/kmrb_buffers.hpp
+    src/kmrb_ui.cpp
+    src/kmrb_ui.hpp
+    src/kmrb_camera.cpp
+    src/kmrb_camera.hpp
     src/kmrb_types.hpp
 )
 
@@ -31,7 +48,7 @@ target_link_libraries(Komorebi PRIVATE
     Vulkan::Vulkan
     glfw
     glm::glm
-    imgui::imgui
+    imgui
     EnTT::EnTT
 )
 
@@ -58,10 +75,11 @@ set(SHADER_DIR "${CMAKE_SOURCE_DIR}/shaders")
 set(SHADER_OUT_DIR "${CMAKE_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
 
-file(GLOB SHADERS "${SHADER_DIR}/*.vert" "${SHADER_DIR}/*.frag" "${SHADER_DIR}/*.comp")
+file(GLOB_RECURSE SHADERS "${SHADER_DIR}/*.vert" "${SHADER_DIR}/*.frag" "${SHADER_DIR}/*.comp")
 
 foreach(SHADER ${SHADERS})
     get_filename_component(SHADER_NAME ${SHADER} NAME)
+    # All SPV outputs go flat into SHADER_OUT_DIR regardless of source subdir
     set(SPIRV_OUTPUT "${SHADER_OUT_DIR}/${SHADER_NAME}.spv")
     add_custom_command(
         OUTPUT ${SPIRV_OUTPUT}

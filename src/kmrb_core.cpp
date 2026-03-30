@@ -1,3 +1,4 @@
+#include "kmrb_ui.hpp"
 #include "kmrb_core.hpp"
 #include <iostream>
 #include <set>
@@ -14,18 +15,68 @@ void Core::init() {
     createSwapchain();
     createImageViews();
 
-    // Initialize ECS — create particle entities
+    // Initialize ECS — create particle entities + scene objects
     sim.init(registry, 10000);
 
-    QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
-    renderer.setComputeShader(KMRB_SHADER_DIR "/gravity.comp");
-    renderer.init(device, physicalDevice, swapchainImageFormat, swapchainExtent,
-                  swapchainImageViews, indices.graphicsFamily.value(),
-                  sim.getParticleCount());
+    // Scene entities — every entity gets Name + Transform, then optional components
+    auto pipeline = registry.create();
+    registry.emplace<Name>(pipeline, "Pipeline");
+    registry.emplace<Transform>(pipeline);
+    registry.emplace<PipelineComponent>(pipeline, PipelineComponent{10000});
+    registry.emplace<ShaderProgramComponent>(pipeline, ShaderProgramComponent{
+        KMRB_SHADER_DIR "/compute/gravity.comp",
+        KMRB_SHADER_DIR "/../shaders/render/particle.vert",
+        KMRB_SHADER_DIR "/../shaders/render/particle.frag",
+        true
+    });
 
-    // Sync ECS data to GPU — gather components into flat array, upload to SSBO
+    auto cam = registry.create();
+    registry.emplace<Name>(cam, "Main Camera");
+    registry.emplace<Transform>(cam, Transform{
+        {0.0f, 2.0f, 5.0f}, {-15.0f, -90.0f, 0.0f}, {1.0f, 1.0f, 1.0f}});
+    registry.emplace<CameraComponent>(cam, CameraComponent{45.0f, 0.1f, 100.0f, true});
+
+
+    auto grid = registry.create();
+    registry.emplace<Name>(grid, "Grid");
+    registry.emplace<Transform>(grid);
+    registry.emplace<GridComponent>(grid);
+
+    QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
+    renderer.init(window, instance, device, physicalDevice,
+                  swapchainImageFormat, swapchainExtent,
+                  swapchainImageViews, indices.graphicsFamily.value(),
+                  graphicsQueue, sim.getParticleCount());
+
+    // Sync ECS data to GPU
     auto particles = sim.syncToSSBO(registry);
     renderer.uploadParticles(device, particles);
+
+    // Wire up UI callbacks
+    renderer.getUI().setProjectRoot(KMRB_SHADER_DIR "/..");  // Points to repo root
+    renderer.getUI().setOnReset([this]() {
+        device.waitIdle();
+        // Only destroy particle entities, not scene objects (cameras, grids, etc.)
+        auto particleView = registry.view<ParticleTag>();
+        registry.destroy(particleView.begin(), particleView.end());
+        // Re-create particles and re-upload
+        sim.init(registry, 10000);
+        auto particles = sim.syncToSSBO(registry);
+        renderer.uploadParticles(device, particles);
+        kmrb::Log::ok("Simulation reset");
+    });
+    renderer.getUI().setOnExportCSV([this](const std::string& path) {
+        device.waitIdle();
+        renderer.getBufferManager().exportToCSV("particle_b", path, {
+            "pos.x", "pos.y", "pos.z", "size",
+            "vel.x", "vel.y", "vel.z", "lifetime",
+            "r", "g", "b", "a"
+        });
+    });
+    renderer.getUI().setWindow(window);
+    renderer.getUI().setRegistry(&registry);
+    renderer.getUI().setBufferManager(&renderer.getBufferManager());
+    renderer.setRegistry(&registry);
 }
 
 void Core::initWindow() {
@@ -73,7 +124,7 @@ void Core::createInstance() {
     );
 
     instance = vk::createInstance(createInfo);
-    std::cout << "[KMRB] Vulkan Instance created (API 1.3)" << std::endl;
+    kmrb::Log::ok("Vulkan Instance created (API 1.3)");
 }
 
 bool Core::checkValidationLayerSupport() {
@@ -105,7 +156,7 @@ void Core::createSurface() {
         throw std::runtime_error("KMRB: Failed to create window surface!");
     }
     surface = rawSurface;
-    std::cout << "[KMRB] Window surface created" << std::endl;
+    kmrb::Log::info("Window surface created");
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -131,7 +182,7 @@ void Core::pickPhysicalDevice() {
     }
 
     vk::PhysicalDeviceProperties props = physicalDevice.getProperties();
-    std::cout << "[KMRB] GPU selected: " << props.deviceName << std::endl;
+    kmrb::Log::ok("GPU selected: ");
 }
 
 bool Core::isDeviceSuitable(vk::PhysicalDevice device) {
@@ -211,7 +262,17 @@ void Core::createLogicalDevice() {
         queueCreateInfos.push_back(vk::DeviceQueueCreateInfo({}, family, 1, &queuePriority));
     }
 
+    // Enable required features
+    vk::PhysicalDeviceFeatures supportedFeatures = physicalDevice.getFeatures();
     vk::PhysicalDeviceFeatures deviceFeatures{};
+    if (supportedFeatures.shaderFloat64) {
+        deviceFeatures.shaderFloat64 = VK_TRUE;
+        kmrb::Log::info("shaderFloat64 enabled");
+    }
+
+    // Vulkan 1.3 features — needed for runtime-compiled shaders that use 1.3 capabilities
+    vk::PhysicalDeviceVulkan13Features features13{};
+    features13.shaderDemoteToHelperInvocation = VK_TRUE;
 
     vk::DeviceCreateInfo createInfo(
         {},
@@ -219,16 +280,17 @@ void Core::createLogicalDevice() {
         queueCreateInfos.data(),
         enableValidationLayers ? static_cast<uint32_t>(validationLayers.size()) : 0,
         enableValidationLayers ? validationLayers.data() : nullptr,
-        static_cast<uint32_t>(deviceExtensions.size()), // Now enabling VK_KHR_swapchain
+        static_cast<uint32_t>(deviceExtensions.size()),
         deviceExtensions.data(),
         &deviceFeatures
     );
+    createInfo.pNext = &features13; // Chain Vulkan 1.3 features
 
     device = physicalDevice.createDevice(createInfo);
     graphicsQueue = device.getQueue(indices.graphicsFamily.value(), 0);
     presentQueue = device.getQueue(indices.presentFamily.value(), 0);
 
-    std::cout << "[KMRB] Logical device created" << std::endl;
+    kmrb::Log::ok("Logical device created");
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -341,8 +403,7 @@ void Core::createSwapchain() {
     swapchainImageFormat = surfaceFormat.format;
     swapchainExtent = extent;
 
-    std::cout << "[KMRB] Swapchain created (" << extent.width << "x" << extent.height
-              << ", " << swapchainImages.size() << " images)" << std::endl;
+    kmrb::Log::info("Swapchain created (" + std::to_string(swapchainImages.size()) + " images)");
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -370,7 +431,7 @@ void Core::createImageViews() {
         swapchainImageViews[i] = device.createImageView(viewInfo);
     }
 
-    std::cout << "[KMRB] Image views created (" << swapchainImageViews.size() << ")" << std::endl;
+    kmrb::Log::info("Image views created (" + std::to_string(swapchainImageViews.size()) + ")");
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -381,7 +442,7 @@ void Core::run() {
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        bool needsRecreate = renderer.drawFrame(device, swapchain, graphicsQueue, presentQueue);
+        bool needsRecreate = renderer.drawFrame(device, swapchain, graphicsQueue, presentQueue, window);
         if (needsRecreate || framebufferResized) {
             framebufferResized = false;
             recreateSwapchain();

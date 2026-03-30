@@ -1,3 +1,4 @@
+#include "kmrb_ui.hpp"
 #include "kmrb_buffers.hpp"
 #include <iostream>
 #include <fstream>
@@ -143,13 +144,13 @@ bool BufferManager::exportToCSV(const std::string& bufferName,
                                 const std::string& filePath,
                                 const std::vector<std::string>& columnHeaders) {
     if (!exists(bufferName)) {
-        std::cerr << "[KMRB] Export failed: buffer '" << bufferName << "' not found" << std::endl;
+        kmrb::Log::error("Export failed: buffer '" + bufferName + "' not found");
         return false;
     }
 
     auto& info = getInfo(bufferName);
     if (info.elementCount == 0 || info.elementStride == 0) {
-        std::cerr << "[KMRB] Export failed: buffer '" << bufferName << "' has no element info set" << std::endl;
+        kmrb::Log::error("Export failed: buffer '" + bufferName + "' has no element info set");
         return false;
     }
 
@@ -158,7 +159,7 @@ bool BufferManager::exportToCSV(const std::string& bufferName,
 
     std::ofstream file(filePath);
     if (!file.is_open()) {
-        std::cerr << "[KMRB] Export failed: cannot open " << filePath << std::endl;
+        kmrb::Log::error("Export failed: cannot open " + filePath);
         return false;
     }
 
@@ -186,8 +187,7 @@ bool BufferManager::exportToCSV(const std::string& bufferName,
     }
 
     file.close();
-    std::cout << "[KMRB] Exported " << info.elementCount << " elements from '"
-              << bufferName << "' to " << filePath << std::endl;
+    kmrb::Log::ok("Exported " + std::to_string(info.elementCount) + " elements from '" + bufferName + "' to " + filePath);
     return true;
 }
 

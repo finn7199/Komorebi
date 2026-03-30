@@ -7,66 +7,91 @@
 
 #include "kmrb_types.hpp"
 #include "kmrb_buffers.hpp"
+#include "kmrb_ui.hpp"
+#include "kmrb_camera.hpp"
+#include "kmrb_sim.hpp"
 
 namespace kmrb {
 
 class Renderer {
 public:
-    void init(vk::Device device, vk::PhysicalDevice physicalDevice,
+    void init(GLFWwindow* window, vk::Instance instance,
+              vk::Device device, vk::PhysicalDevice physicalDevice,
               vk::Format swapchainFormat, vk::Extent2D extent,
               const std::vector<vk::ImageView>& swapchainImageViews,
-              uint32_t graphicsQueueFamily,
+              uint32_t graphicsQueueFamily, vk::Queue graphicsQueue,
               uint32_t particleCount = 10000);
     void cleanup(vk::Device device);
 
-    // Swapchain recreation — destroys/recreates only size-dependent resources
     void onSwapchainRecreate(vk::Device device, vk::Extent2D newExtent,
                              const std::vector<vk::ImageView>& newImageViews);
 
-    // Returns true if swapchain needs recreation (window resized, OUT_OF_DATE)
     bool drawFrame(vk::Device device, vk::SwapchainKHR swapchain,
-                   vk::Queue graphicsQueue, vk::Queue presentQueue);
+                   vk::Queue graphicsQueue, vk::Queue presentQueue,
+                   GLFWwindow* window);
 
-    // Upload particle data from CPU (ECS sync) to both SSBO buffers
     void uploadParticles(vk::Device device, const std::vector<Particle>& particles);
+    void setRegistry(entt::registry* reg) { registry = reg; }
 
-    // Set the compute shader source file to watch for hot-reload
-    void setComputeShader(const std::string& path);
-
-    vk::RenderPass getRenderPass() const { return renderPass; }
+    vk::RenderPass getRenderPass() const { return offscreenPass; }
     vk::PipelineLayout getPipelineLayout() const { return pipelineLayout; }
     const BufferManager& getBufferManager() const { return bufferManager; }
+    BufferManager& getBufferManager() { return bufferManager; }
+    UI& getUI() { return ui; }
 
 private:
     vk::PhysicalDevice physicalDevice;
+    GLFWwindow* cachedWindow = nullptr;
+    entt::registry* registry = nullptr;
 
-    // ── Render Pass & Pipelines ──
-    vk::RenderPass renderPass;
-    vk::PipelineLayout pipelineLayout;     // Shared between graphics and compute
-    vk::Pipeline graphicsPipeline;
-    vk::Pipeline computePipeline;          // Particle simulation
-    std::vector<vk::Framebuffer> framebuffers;
+    // ── Two Render Passes ──
+    // Offscreen: particles → color+depth image (sampled by ImGui as texture)
+    // Swapchain: ImGui only → presented to screen
+    vk::RenderPass offscreenPass;
+    vk::RenderPass swapchainPass;
 
-    // ── Depth Buffer ──
-    // Single depth image shared across frames (only one frame renders at a time per framebuffer)
-    vk::Image depthImage;
-    vk::DeviceMemory depthImageMemory;
-    vk::ImageView depthImageView;
+    vk::PipelineLayout pipelineLayout;
+    vk::Pipeline gridPipeline;        // Lines — grid rendering (always present)
+
+    // Per-entity shader instances — replaces singleton pipelines
+    struct ShaderInstance {
+        entt::entity owner = entt::null;
+        vk::Pipeline computePipeline = nullptr;
+        vk::Pipeline graphicsPipeline = nullptr;
+        std::string computePath, vertexPath, fragmentPath;
+        std::filesystem::file_time_type compModTime{}, vertModTime{}, fragModTime{};
+    };
+    std::unordered_map<uint32_t, ShaderInstance> shaderInstances;
+
+    // ── Offscreen Framebuffer (simulation viewport) ──
+    vk::Image offscreenColor;
+    vk::DeviceMemory offscreenColorMemory;
+    vk::ImageView offscreenColorView;
+    vk::Image offscreenDepth;
+    vk::DeviceMemory offscreenDepthMemory;
+    vk::ImageView offscreenDepthView;
+    vk::Framebuffer offscreenFramebuffer;
+    vk::Sampler offscreenSampler;
+    vk::DescriptorSet offscreenImGuiDescriptor = nullptr; // ImGui texture handle
+    vk::Format colorFormat;
     vk::Format depthFormat = vk::Format::eD32Sfloat;
 
+    // ── Swapchain Framebuffers (ImGui only) ──
+    std::vector<vk::Framebuffer> swapchainFramebuffers;
+
     // ── Descriptor System ──
-    // 3 layouts following the KMRB convention (global / material / object)
     std::array<vk::DescriptorSetLayout, DESCRIPTOR_SET_COUNT> descriptorSetLayouts;
     vk::DescriptorPool descriptorPool;
-    std::vector<vk::DescriptorSet> globalDescriptorSets; // One per swapchain image
+    std::vector<vk::DescriptorSet> globalDescriptorSets;
+
+    // ── UI & Camera ──
+    UI ui;
+    Camera camera;
 
     // ── Buffer Manager ──
     BufferManager bufferManager;
-    // Buffer names used as keys:
-    //   "global_ubo_0", "global_ubo_1", ...   — per swapchain image
-    //   "particle_a", "particle_b"            — double-buffered SSBOs
 
-    std::array<vk::DescriptorSet, 2> particleDescriptorSets; // [0]: A→B, [1]: B→A
+    std::array<vk::DescriptorSet, 2> particleDescriptorSets;
     uint32_t particleCount = 0;
     uint32_t pingPong = 0;
 
@@ -86,40 +111,43 @@ private:
     uint32_t graphicsQueueFamily = 0;
     vk::Extent2D extent;
     float elapsedTime = 0.0f;
+    float computeTime = 0.0f;
 
-    // ── Shader Hot-Reload ──
-    std::string computeShaderPath;                          // Source .comp file to watch
-    std::filesystem::file_time_type lastShaderModTime;      // Last known modification time
-    float shaderPollTimer = 0.0f;                           // Accumulator for poll interval
-    static constexpr float SHADER_POLL_INTERVAL = 0.5f;    // Check every 0.5 seconds
+    bool currentF64 = false;
 
     // ── Init Helpers ──
-    void createRenderPass(vk::Device device, const RenderPassConfig& config);
+    uint32_t gridVertexCount = 0;
+
+    void createOffscreenPass(vk::Device device);
+    void createGridPipeline(vk::Device device);
+    void updateGridBuffer(vk::Device device);
+    void createSwapchainRenderPass(vk::Device device);
     void createDescriptorSetLayouts(vk::Device device);
-    void createGraphicsPipeline(vk::Device device);
-    void createComputePipeline(vk::Device device);
-    void createDepthResources(vk::Device device);
-    void createFramebuffers(vk::Device device, const std::vector<vk::ImageView>& swapchainImageViews);
+    void createPipelineLayout(vk::Device device);
+    void createOffscreenResources(vk::Device device);
+    void createSwapchainFramebuffers(vk::Device device, const std::vector<vk::ImageView>& imageViews);
     void createGlobalUBOBuffers(vk::Device device);
     void createDescriptorPool(vk::Device device);
     void createDescriptorSets(vk::Device device);
     void createParticleBuffer(vk::Device device);
-    void createCommandPool(vk::Device device, uint32_t graphicsQueueFamily);
+    void createCommandPool(vk::Device device, uint32_t queueFamily);
     void createCommandBuffers(vk::Device device);
     void createSyncObjects(vk::Device device);
 
     void cleanupSwapchainResources(vk::Device device);
+    void cleanupOffscreenResources(vk::Device device);
     void recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex);
     void updateGlobalUBO(uint32_t imageIndex);
-    void checkShaderReload(vk::Device device);
 
-    // ── Vulkan Helpers ──
+    // Shader instance management — syncs ECS ShaderProgramComponents to Vulkan pipelines
+    void syncShaderInstances(vk::Device device);
+    void destroyShaderInstance(vk::Device device, ShaderInstance& inst);
+    vk::Pipeline buildComputePipeline(vk::Device device, const std::string& path);
+    vk::Pipeline buildGraphicsPipeline(vk::Device device, const std::string& vertPath, const std::string& fragPath);
+
     vk::ShaderModule createShaderModule(vk::Device device, const std::vector<char>& code);
     static std::vector<char> readFile(const std::string& filename);
-
-    // Runtime GLSL → SPIR-V compilation via glslc subprocess
-    // Returns empty vector on failure (errors printed to console)
-    static std::vector<uint32_t> compileGLSL(const std::string& sourcePath);
+    static std::vector<uint32_t> compileGLSL(const std::string& sourcePath, bool useF64 = false);
 };
 
 } // namespace kmrb

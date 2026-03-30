@@ -1,6 +1,9 @@
 #version 450
 
-// Workgroup size — 256 threads is a good default for NVIDIA/AMD
+#ifdef USE_F64
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+#endif
+
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) uniform GlobalUBO {
@@ -17,8 +20,6 @@ struct Particle {
     vec4 color;     // rgba
 };
 
-// Double-buffered: read from input, write to output
-// Prevents read-write hazards — no thread reads data another thread just wrote
 layout(set = 2, binding = 0) readonly buffer ParticleInput {
     Particle particles[];
 } ssboIn;
@@ -33,19 +34,40 @@ void main() {
 
     Particle p = ssboIn.particles[index];
 
+#ifdef USE_F64
+    // Double-precision physics — higher accuracy for large-scale simulations
+    float64_t dt = float64_t(global.deltaTime);
+    float64_t px = float64_t(p.position.x);
+    float64_t py = float64_t(p.position.y);
+    float64_t pz = float64_t(p.position.z);
+    float64_t vx = float64_t(p.velocity.x);
+    float64_t vy = float64_t(p.velocity.y);
+    float64_t vz = float64_t(p.velocity.z);
+
+    vy -= 9.8lf * dt;
+    px += vx * dt;
+    py += vy * dt;
+    pz += vz * dt;
+
+    if (py < -2.0lf) {
+        py = -2.0lf;
+        vy *= -0.7lf;
+    }
+
+    p.position.xyz = vec3(float(px), float(py), float(pz));
+    p.velocity.xyz = vec3(float(vx), float(vy), float(vz));
+#else
+    // Standard single-precision
     float dt = global.deltaTime;
 
-    // Gravity
     p.velocity.y -= 9.8 * dt;
-
-    // Integrate position
     p.position.xyz += p.velocity.xyz * dt;
 
-    // Floor bounce at y = -2
     if (p.position.y < -2.0) {
         p.position.y = -2.0;
         p.velocity.y *= -0.7;
     }
+#endif
 
     ssboOut.particles[index] = p;
 }
