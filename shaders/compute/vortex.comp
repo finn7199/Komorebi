@@ -16,26 +16,20 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // PUSH CONSTANTS — tweakable parameters
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// The engine reads this block via SPIRV-Reflect and auto-generates
-// Inspector sliders/widgets for each parameter.
-//
 // RULES:
-//   1. 'model' (mat4) and 'color' (vec4) are ENGINE BUILT-INS at offsets 0-79.
-//      They MUST be declared first and in this order. Do NOT remove them.
-//   2. Add your own parameters AFTER color. These will appear as
-//      live-tweakable controls in the Pipeline Inspector.
-//   3. Total push constant size must not exceed 128 bytes.
-//      model(64) + color(16) = 80 used → 48 bytes free for your params.
-//   4. Supported types: float, vec2, vec3, vec4, int, bool
+//   1. 'model' and 'color' are engine built-ins. Do NOT remove them.
+//   2. Add your params AFTER color. They appear as Inspector sliders.
+//   3. Max 128 bytes total (48 bytes free after model + color).
 //
 layout(push_constant) uniform Params {
     mat4 model;         // Engine built-in (do not remove)
     vec4 color;         // Engine built-in (do not remove)
 
     // ── Your parameters below ──
-    float gravity;      // Gravitational acceleration (default: 9.8)
-    float bounceDamp;   // Energy retained on bounce, 0-1 (default: 0.7)
-    float floorY;       // Y position of the floor plane (default: -2.0)
+    float radius;       // Vortex outer radius
+    float lift;         // Upward pull strength
+    float twist;        // Rotational speed around Y axis
+    float damping;      // Velocity damping (0 = no damping, 1 = full stop)
 } params;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -56,7 +50,7 @@ layout(set = 2, binding = 1) writeonly buffer ParticleOutput {
 } ssboOut;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// MAIN
+// MAIN — tornado/vortex simulation
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 void main() {
     uint index = gl_GlobalInvocationID.x;
@@ -65,14 +59,40 @@ void main() {
     Particle p = ssboIn.particles[index];
     float dt = global.deltaTime;
 
-    // Use reflected push constant values — controlled by Inspector sliders
-    p.velocity.y -= params.gravity * dt;
-    p.position.xyz += p.velocity.xyz * dt;
+    vec3 pos = p.position.xyz;
+    vec3 vel = p.velocity.xyz;
 
-    if (p.position.y < params.floorY) {
-        p.position.y = params.floorY;
-        p.velocity.y *= -params.bounceDamp;
+    // Vector from particle to vortex center (Y axis at origin)
+    vec2 toCenter = -pos.xz;
+    float dist = length(toCenter);
+
+    // Tangential force — perpendicular to the radius, creates the spin.
+    // Strength falls off with distance so particles near the center spin faster.
+    float tangentStrength = params.twist / max(dist, 0.1);
+    vec2 tangent = vec2(-toCenter.y, toCenter.x) * tangentStrength;
+
+    // Inward pull — draws particles toward the vortex center
+    vec2 inward = toCenter * (1.0 / max(dist, 0.1)) * params.radius;
+
+    // Upward lift — particles rise as they get closer to the center
+    float liftForce = params.lift / max(dist, 0.5);
+
+    // Apply forces
+    vel.xz += (tangent + inward) * dt;
+    vel.y += liftForce * dt;
+
+    // Damping — bleed off energy so particles don't fly away
+    vel *= (1.0 - params.damping * dt);
+
+    // Wrap particles that go too high back to the bottom
+    pos += vel * dt;
+    if (pos.y > 5.0) {
+        pos.y = -2.0;
+        vel.y = 0.0;
     }
+
+    p.position.xyz = pos;
+    p.velocity.xyz = vel;
 
     ssboOut.particles[index] = p;
 }

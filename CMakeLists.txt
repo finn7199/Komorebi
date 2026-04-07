@@ -8,6 +8,7 @@ find_package(Vulkan REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(EnTT CONFIG REQUIRED)
+find_package(Stb REQUIRED)
 
 # Vulkan SDK ships shaderc and SPIRV tools — point CMake to them
 set(VULKAN_SDK_PATH "$ENV{VULKAN_SDK}")
@@ -41,6 +42,7 @@ add_executable(Komorebi
     src/kmrb_camera.cpp
     src/kmrb_camera.hpp
     src/kmrb_types.hpp
+    src/stb_image_impl.cpp
 )
 
 # Link the libraries to our executable
@@ -61,6 +63,8 @@ target_compile_definitions(Komorebi PRIVATE
 # Vulkan SDK include path (for spirv-reflect, spirv-cross headers)
 target_include_directories(Komorebi PRIVATE
     "${VULKAN_SDK_PATH}/Include"
+    "${VULKAN_SDK_PATH}/Source/SPIRV-Reflect"
+    ${Stb_INCLUDE_DIR}
 )
 
 # Vulkan SDK libraries: spirv-reflect (introspection)

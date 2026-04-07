@@ -9,29 +9,15 @@ namespace kmrb {
 void Simulation::init(entt::registry& registry, uint32_t count) {
     particleCount = count;
 
-    srand(42);
+    // Create zeroed particle entities — the init shader sets actual positions on the GPU.
     for (uint32_t i = 0; i < count; i++) {
         auto entity = registry.create();
-
-        // Random point in a sphere (radius 1.5)
-        float theta = static_cast<float>(rand()) / RAND_MAX * 6.2831853f;
-        float phi = acos(1.0f - 2.0f * static_cast<float>(rand()) / RAND_MAX);
-        float r = cbrt(static_cast<float>(rand()) / RAND_MAX) * 1.5f;
-
-        float x = r * sin(phi) * cos(theta);
-        float y = r * sin(phi) * sin(theta);
-        float z = r * cos(phi);
-
         registry.emplace<ParticleTag>(entity);
-        registry.emplace<ParticlePosition>(entity, glm::vec3(x, y, z));
+        registry.emplace<ParticlePosition>(entity, glm::vec3(0.0f));
         registry.emplace<Velocity>(entity, glm::vec3(0.0f));
         registry.emplace<Mass>(entity, 1.0f);
         registry.emplace<PointSize>(entity, 2.0f);
-        registry.emplace<Color>(entity, glm::vec4(
-            0.4f + 0.6f * (r / 1.5f),
-            0.2f + 0.3f * (1.0f - r / 1.5f),
-            0.8f, 1.0f
-        ));
+        registry.emplace<Color>(entity, glm::vec4(1.0f));
     }
 
     kmrb::Log::ok("ECS initialized (" + std::to_string(count) + " particle entities)");

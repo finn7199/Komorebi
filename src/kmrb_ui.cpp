@@ -1,6 +1,7 @@
 #include "kmrb_ui.hpp"
 #include "kmrb_buffers.hpp"
 #include "kmrb_sim.hpp"
+#include "kmrb_renderer.hpp"  // For ShaderInstance / ReflectedParam types in Inspector
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
 #include <imgui.h>
@@ -194,6 +195,7 @@ void UI::drawEditorLayout(vk::DescriptorSet viewportTexture, vk::Extent2D viewpo
     drawConsole();
     drawDataOutput();
 
+    if (showPreferences) drawPreferences();
     if (showDemoWindow) ImGui::ShowDemoWindow(&showDemoWindow);
 }
 
@@ -248,6 +250,84 @@ void UI::drawMenuBar() {
 
             ImGui::Separator();
 
+            if (ImGui::MenuItem("New Init Shader")) {
+                if (!projectRoot.empty()) {
+                    namespace fs = std::filesystem;
+                    std::string shadersDir = projectRoot + "/shaders/compute";
+                    fs::create_directories(shadersDir);
+
+                    std::string name = "init.comp";
+                    int n = 1;
+                    while (fs::exists(shadersDir + "/" + name)) {
+                        name = "init_" + std::to_string(n++) + ".comp";
+                    }
+
+                    std::string path = shadersDir + "/" + name;
+                    std::ofstream f(path);
+                    f << "#version 450\n\n"
+                      << "// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                      << "// INIT SHADER — runs ONCE to set up particle positions, velocities, colors.\n"
+                      << "// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                      << "// This shader dispatches once when:\n"
+                      << "//   - A Pipeline entity is first created\n"
+                      << "//   - The simulation is reset (Simulation > Restart)\n"
+                      << "//   - The init shader file is modified (hot-reload)\n"
+                      << "//\n"
+                      << "// Drag this file onto the \"Init\" slot in the Pipeline Inspector.\n"
+                      << "// It writes to ssboOut — the same buffer that the compute shader reads from.\n"
+                      << "//\n"
+                      << "// EXAMPLES:\n"
+                      << "//   Random sphere:  scatter particles on a sphere surface\n"
+                      << "//   Grid:           place particles in a uniform 3D grid\n"
+                      << "//   Custom shapes:  5 clusters, a ring, a cube outline, etc.\n"
+                      << "//   Single object:  one particle at a specific location\n"
+                      << "// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                      << "layout(local_size_x = 256) in;\n\n"
+                      << "// ── Global UBO (read-only, provided by engine) ──\n"
+                      << "layout(set = 0, binding = 0) uniform GlobalUBO {\n"
+                      << "    mat4 view;\n    mat4 proj;\n    vec4 cameraPos;\n"
+                      << "    float time;\n    float deltaTime;\n} global;\n\n"
+                      << "// ── Particle SSBO ──\n"
+                      << "struct Particle {\n"
+                      << "    vec4 position;  // xyz = pos, w = point size\n"
+                      << "    vec4 velocity;  // xyz = vel, w = lifetime\n"
+                      << "    vec4 color;     // rgba\n"
+                      << "};\n\n"
+                      << "layout(set = 2, binding = 0) readonly buffer ParticleInput {\n"
+                      << "    Particle particles[];\n} ssboIn;\n\n"
+                      << "layout(set = 2, binding = 1) writeonly buffer ParticleOutput {\n"
+                      << "    Particle particles[];\n} ssboOut;\n\n"
+                      << "// ── Simple hash for pseudo-random numbers from particle index ──\n"
+                      << "float hash(uint n) {\n"
+                      << "    n = (n << 13u) ^ n;\n"
+                      << "    n = n * (n * n * 15731u + 789221u) + 1376312589u;\n"
+                      << "    return float(n & 0x7fffffffu) / float(0x7fffffff);\n"
+                      << "}\n\n"
+                      << "void main() {\n"
+                      << "    uint index = gl_GlobalInvocationID.x;\n"
+                      << "    if (index >= ssboIn.particles.length()) return;\n\n"
+                      << "    Particle p;\n\n"
+                      << "    // ── Random sphere distribution (replace with your own logic) ──\n"
+                      << "    float r1 = hash(index * 3u + 0u);      // 0 to 1\n"
+                      << "    float r2 = hash(index * 3u + 1u);      // 0 to 1\n"
+                      << "    float r3 = hash(index * 3u + 2u);      // 0 to 1\n\n"
+                      << "    float theta = r1 * 6.28318;            // Azimuth: 0 to 2*pi\n"
+                      << "    float phi = acos(1.0 - 2.0 * r2);     // Polar: uniform on sphere\n"
+                      << "    float radius = 2.0 * pow(r3, 0.333);  // Cube root for volume fill\n\n"
+                      << "    p.position.xyz = vec3(\n"
+                      << "        radius * sin(phi) * cos(theta),\n"
+                      << "        radius * sin(phi) * sin(theta),\n"
+                      << "        radius * cos(phi)\n"
+                      << "    );\n"
+                      << "    p.position.w = 2.0;                    // Point size\n\n"
+                      << "    p.velocity = vec4(0.0);                // Start at rest\n"
+                      << "    p.color = vec4(1.0, 0.9, 0.7, 1.0);   // Warm white\n\n"
+                      << "    ssboOut.particles[index] = p;\n}\n";
+                    f.close();
+                    kmrb::Log::ok("Created shader: " + name);
+                }
+            }
+
             if (ImGui::MenuItem("New Compute Shader")) {
                 if (!projectRoot.empty()) {
                     namespace fs = std::filesystem;
@@ -262,11 +342,38 @@ void UI::drawMenuBar() {
 
                     std::string path = shadersDir + "/" + name;
                     std::ofstream f(path);
-                    f << "#version 450\n\nlayout(local_size_x = 256) in;\n\n"
+                    f << "#version 450\n\n"
+                      << "layout(local_size_x = 256) in;\n\n"
+                      << "// ── Global UBO (read-only, provided by engine) ──\n"
                       << "layout(set = 0, binding = 0) uniform GlobalUBO {\n"
                       << "    mat4 view;\n    mat4 proj;\n    vec4 cameraPos;\n"
                       << "    float time;\n    float deltaTime;\n} global;\n\n"
-                      << "struct Particle {\n    vec4 position;\n    vec4 velocity;\n    vec4 color;\n};\n\n"
+                      << "// ── Environment Map (optional, set in Scene > Environment) ──\n"
+                      << "// Cubemap sampler bound by the engine. Returns black if no HDR is loaded.\n"
+                      << "// layout(set = 1, binding = 0) uniform samplerCube envMap;\n\n"
+                      << "// ── Push Constants (tweakable in Inspector) ──\n"
+                      << "// SPIRV-Reflect auto-generates sliders for each parameter.\n"
+                      << "//\n"
+                      << "// RULES:\n"
+                      << "//   1. 'model' (mat4) and 'color' (vec4) are ENGINE BUILT-INS.\n"
+                      << "//      They MUST be first, in this order. Do NOT remove them.\n"
+                      << "//   2. Add your own params AFTER color. They appear as live controls.\n"
+                      << "//   3. Max 128 bytes total. model(64) + color(16) = 80 used,\n"
+                      << "//      leaving 48 bytes for your params.\n"
+                      << "//   4. Supported types: float, vec2, vec3, vec4, int, bool\n"
+                      << "//\n"
+                      << "layout(push_constant) uniform Params {\n"
+                      << "    mat4 model;         // Engine built-in (do not remove)\n"
+                      << "    vec4 color;         // Engine built-in (do not remove)\n\n"
+                      << "    // ── Your parameters below ──\n"
+                      << "    // float myParam;   // Example: uncomment and use in main()\n"
+                      << "} params;\n\n"
+                      << "// ── Particle SSBO (ping-pong double-buffered) ──\n"
+                      << "struct Particle {\n"
+                      << "    vec4 position;  // xyz = pos, w = point size\n"
+                      << "    vec4 velocity;  // xyz = vel, w = lifetime\n"
+                      << "    vec4 color;     // rgba\n"
+                      << "};\n\n"
                       << "layout(set = 2, binding = 0) readonly buffer ParticleInput {\n"
                       << "    Particle particles[];\n} ssboIn;\n\n"
                       << "layout(set = 2, binding = 1) writeonly buffer ParticleOutput {\n"
@@ -283,19 +390,118 @@ void UI::drawMenuBar() {
                 }
             }
 
-            if (ImGui::MenuItem("Import Shader...")) {
+            if (ImGui::MenuItem("New Vertex Shader")) {
+                if (!projectRoot.empty()) {
+                    namespace fs = std::filesystem;
+                    std::string shadersDir = projectRoot + "/shaders/render";
+                    fs::create_directories(shadersDir);
+
+                    std::string name = "custom.vert";
+                    int n = 1;
+                    while (fs::exists(shadersDir + "/" + name)) {
+                        name = "custom_" + std::to_string(n++) + ".vert";
+                    }
+
+                    std::string path = shadersDir + "/" + name;
+                    std::ofstream f(path);
+                    f << "#version 450\n\n"
+                      << "// ── Global UBO (read-only, provided by engine) ──\n"
+                      << "layout(set = 0, binding = 0) uniform GlobalUBO {\n"
+                      << "    mat4 view;\n    mat4 proj;\n    vec4 cameraPos;\n"
+                      << "    float time;\n    float deltaTime;\n} global;\n\n"
+                      << "// ── Push Constants ──\n"
+                      << "// Must match the compute shader's push constant layout.\n"
+                      << "layout(push_constant) uniform PushConstants {\n"
+                      << "    mat4 model;\n"
+                      << "    vec4 color;\n"
+                      << "} push;\n\n"
+                      << "// ── Particle SSBO ──\n"
+                      << "// Binding 1 = the output buffer that compute just wrote to.\n"
+                      << "struct Particle {\n"
+                      << "    vec4 position;  // xyz = pos, w = point size\n"
+                      << "    vec4 velocity;  // xyz = vel, w = lifetime\n"
+                      << "    vec4 color;     // rgba\n"
+                      << "};\n\n"
+                      << "layout(set = 2, binding = 1) readonly buffer ParticleSSBO {\n"
+                      << "    Particle particles[];\n} ssbo;\n\n"
+                      << "// ── Outputs to fragment shader ──\n"
+                      << "layout(location = 0) out vec3 fragColor;\n\n"
+                      << "void main() {\n"
+                      << "    Particle p = ssbo.particles[gl_VertexIndex];\n\n"
+                      << "    vec4 worldPos = push.model * vec4(p.position.xyz, 1.0);\n"
+                      << "    gl_Position = global.proj * global.view * worldPos;\n"
+                      << "    gl_PointSize = max(p.position.w, 1.0);\n\n"
+                      << "    fragColor = p.color.rgb * push.color.rgb;\n}\n";
+                    f.close();
+                    kmrb::Log::ok("Created shader: " + name);
+                }
+            }
+
+            if (ImGui::MenuItem("New Fragment Shader")) {
+                if (!projectRoot.empty()) {
+                    namespace fs = std::filesystem;
+                    std::string shadersDir = projectRoot + "/shaders/render";
+                    fs::create_directories(shadersDir);
+
+                    std::string name = "custom.frag";
+                    int n = 1;
+                    while (fs::exists(shadersDir + "/" + name)) {
+                        name = "custom_" + std::to_string(n++) + ".frag";
+                    }
+
+                    std::string path = shadersDir + "/" + name;
+                    std::ofstream f(path);
+                    f << "#version 450\n\n"
+                      << "// ── Environment Map (optional, set in Scene > Environment) ──\n"
+                      << "// Cubemap sampler bound by the engine. Returns black if no HDR is loaded.\n"
+                      << "// Sample with a direction vector: texture(envMap, direction).rgb\n"
+                      << "//\n"
+                      << "// Common uses:\n"
+                      << "//   Reflection:  texture(envMap, reflect(-viewDir, normal)).rgb\n"
+                      << "//   Ambient:     texture(envMap, normal).rgb * 0.2\n"
+                      << "//   Sky color:   texture(envMap, vec3(0, 1, 0)).rgb\n"
+                      << "//\n"
+                      << "// Values are HDR (can be > 1.0). Tone map if outputting directly:\n"
+                      << "//   color = color / (color + vec3(1.0));  // Reinhard\n"
+                      << "//\n"
+                      << "layout(set = 1, binding = 0) uniform samplerCube envMap;\n\n"
+                      << "// ── Inputs from vertex shader ──\n"
+                      << "layout(location = 0) in vec3 fragColor;\n\n"
+                      << "layout(location = 0) out vec4 outColor;\n\n"
+                      << "void main() {\n"
+                      << "    // Round point sprite (discard pixels outside circle)\n"
+                      << "    vec2 coord = gl_PointCoord - vec2(0.5);\n"
+                      << "    if (dot(coord, coord) > 0.25) discard;\n\n"
+                      << "    // Example: sample environment map upward for ambient tint\n"
+                      << "    // vec3 ambient = texture(envMap, vec3(0, 1, 0)).rgb * 0.1;\n\n"
+                      << "    outColor = vec4(fragColor, 1.0);\n}\n";
+                    f.close();
+                    kmrb::Log::ok("Created shader: " + name);
+                }
+            }
+
+            if (ImGui::MenuItem("Import File...")) {
                 std::string path = openFileDialog(
-                    "Compute Shader (*.comp)\0*.comp\0GLSL (*.glsl;*.vert;*.frag)\0*.glsl;*.vert;*.frag\0All Files\0*.*\0",
-                    "Import Shader");
+                    "All Supported\0*.comp;*.vert;*.frag;*.glsl;*.hdr;*.kmrb\0"
+                    "Shaders (*.comp;*.vert;*.frag)\0*.comp;*.vert;*.frag\0"
+                    "HDR Images (*.hdr)\0*.hdr\0"
+                    "All Files\0*.*\0",
+                    "Import File");
                 if (!path.empty() && !projectRoot.empty()) {
                     namespace fs = std::filesystem;
                     std::string ext = fs::path(path).extension().string();
-                    std::string destDir = projectRoot + "/shaders/"
-                        + (ext == ".comp" ? "compute" : "render");
+                    std::string filename = fs::path(path).filename().string();
+
+                    // Route shaders to their subdirectories, everything else to project root
+                    std::string destDir;
+                    if (ext == ".comp") destDir = projectRoot + "/shaders/compute";
+                    else if (ext == ".vert" || ext == ".frag") destDir = projectRoot + "/shaders/render";
+                    else destDir = projectRoot;
+
                     fs::create_directories(destDir);
-                    std::string destPath = destDir + "/" + fs::path(path).filename().string();
+                    std::string destPath = destDir + "/" + filename;
                     fs::copy_file(path, destPath, fs::copy_options::overwrite_existing);
-                    kmrb::Log::ok("Imported: " + fs::path(path).filename().string());
+                    kmrb::Log::ok("Imported: " + filename);
                 }
             }
 
@@ -324,10 +530,29 @@ void UI::drawMenuBar() {
             ImGui::EndMenu();
         }
 
+        // ── EDIT ──
+        if (ImGui::BeginMenu("Edit")) {
+            if (ImGui::MenuItem("Preferences")) {
+                showPreferences = true;
+            }
+            ImGui::EndMenu();
+        }
+
         // ── SIMULATION ──
         if (ImGui::BeginMenu("Simulation")) {
-            if (ImGui::MenuItem("Reset", "Ctrl+R")) {
+            if (ImGui::MenuItem(simRunning ? "Pause" : "Play", "Space")) {
+                simRunning = !simRunning;
+                Log::info(simRunning ? "Simulation playing" : "Simulation paused");
+            }
+            if (ImGui::MenuItem("Step Forward", "N", false, !simRunning)) {
+                stepRequested = true;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Restart", "Ctrl+R")) {
                 if (onReset) onReset();
+            }
+            if (ImGui::MenuItem("Reload Shaders")) {
+                if (onReloadShaders) onReloadShaders();
             }
             ImGui::EndMenu();
         }
@@ -355,13 +580,48 @@ void UI::drawProjectBrowser() {
         } else {
             namespace fs = std::filesystem;
 
-            // Show only content directories — shaders and scenes
+            // Show content directories and root-level files (HDR, etc.)
             std::string shadersDir = projectRoot + "/shaders";
             std::string scenesDir = projectRoot + "/scenes";
 
             if (fs::exists(shadersDir) && ImGui::TreeNodeEx("shaders", ImGuiTreeNodeFlags_DefaultOpen)) {
                 drawFileTree(shadersDir);
                 ImGui::TreePop();
+            }
+
+            // Root-level asset files (HDR images, etc.) — shown without a subfolder.
+            // Only shows supported file types, skips directories.
+            for (auto& entry : fs::directory_iterator(projectRoot)) {
+                if (!entry.is_regular_file()) continue;
+                auto ext = entry.path().extension().string();
+                if (ext != ".hdr") continue;  // Only show supported root-level asset types
+
+                std::string name = entry.path().filename().string();
+                std::string fullPath = entry.path().string();
+                std::replace(fullPath.begin(), fullPath.end(), '\\', '/');
+
+                ImGuiTreeNodeFlags fileFlags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+                if (selectedFile == fullPath) fileFlags |= ImGuiTreeNodeFlags_Selected;
+
+                ImGui::PushStyleColor(ImGuiCol_Text, hex(0x5AAFCC));  // Cyan for HDR
+                ImGui::TreeNodeEx(name.c_str(), fileFlags);
+                ImGui::PopStyleColor();
+
+                // Drag-drop source for HDR files
+                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+                    ImGui::SetDragDropPayload("KMRB_HDR_PATH", fullPath.c_str(), fullPath.size() + 1);
+                    ImGui::TextColored(hex(0x5AAFCC), "%s", name.c_str());
+                    ImGui::EndDragDropSource();
+                }
+
+                if (ImGui::IsItemClicked()) selectedFile = fullPath;
+
+                if (ImGui::IsItemHovered()) {
+                    ImGui::BeginTooltip();
+                    ImGui::TextColored(hex(0x8B7D6B), "%s", fullPath.c_str());
+                    ImGui::TextColored(hex(0x5C5347), "Drag onto Scene > Environment to set as skybox");
+                    ImGui::EndTooltip();
+                }
             }
 
             if (fs::exists(scenesDir) && ImGui::TreeNodeEx("scenes", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -393,13 +653,13 @@ void UI::drawFileTree(const std::string& directory) {
         if (entry.is_directory()) {
             // Skip hidden/build/external dirs
             auto name = entry.path().filename().string();
-            if (name[0] == '.' || name == "build" || name == "external") continue;
+            if (name[0] == '.' || name == "build" || name == "external" || name == "engine") continue;
             folders.push_back(entry);
         } else {
             auto ext = entry.path().extension().string();
-            // Only show shader and scene files
+            // Only show shader, scene, and HDR files
             if (ext == ".comp" || ext == ".vert" || ext == ".frag"
-                || ext == ".glsl" || ext == ".kmrb" || ext == ".ksfx") {
+                || ext == ".glsl" || ext == ".kmrb" || ext == ".ksfx" || ext == ".hdr") {
                 files.push_back(entry);
             }
         }
@@ -434,6 +694,8 @@ void UI::drawFileTree(const std::string& directory) {
             ImGui::PushStyleColor(ImGuiCol_Text, hex(0xC8A44E));  // Gold for compute
         } else if (ext == ".vert" || ext == ".frag") {
             ImGui::PushStyleColor(ImGuiCol_Text, hex(0x5A9BD4));  // Blue for render shaders
+        } else if (ext == ".hdr") {
+            ImGui::PushStyleColor(ImGuiCol_Text, hex(0x5AAFCC));  // Cyan for HDR env maps
         } else {
             ImGui::PushStyleColor(ImGuiCol_Text, hex(0xE8DCC8));  // Primary text
         }
@@ -445,6 +707,15 @@ void UI::drawFileTree(const std::string& directory) {
             if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
                 ImGui::SetDragDropPayload("KMRB_SHADER_PATH", fullPath.c_str(), fullPath.size() + 1);
                 ImGui::TextColored(hex(0xC8A44E), "%s", name.c_str());
+                ImGui::EndDragDropSource();
+            }
+        }
+
+        // Drag-drop source for HDR files — drag onto Scene > Environment slot
+        if (ext == ".hdr") {
+            if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+                ImGui::SetDragDropPayload("KMRB_HDR_PATH", fullPath.c_str(), fullPath.size() + 1);
+                ImGui::TextColored(hex(0x5AAFCC), "%s", name.c_str());
                 ImGui::EndDragDropSource();
             }
         }
@@ -494,6 +765,8 @@ void UI::drawFileTree(const std::string& directory) {
             if (ext == ".comp" || ext == ".vert" || ext == ".frag") {
                 ImGui::TextColored(hex(0x5C5347), "Drag onto Inspector to attach");
                 ImGui::TextColored(hex(0x5C5347), "Double-click: open in editor");
+            } else if (ext == ".hdr") {
+                ImGui::TextColored(hex(0x5C5347), "Drag onto Scene > Environment to set as skybox");
             }
             ImGui::EndTooltip();
         }
@@ -585,9 +858,16 @@ void UI::drawSceneHierarchy() {
             }
         };
 
-        // Scene root
-        ImGuiTreeNodeFlags rootFlags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow;
+        // Scene root — clicking it shows scene-level settings in Inspector
+        ImGuiTreeNodeFlags rootFlags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow
+                                     | ImGuiTreeNodeFlags_SpanAvailWidth;
+        if (selectionType == SelectionType::Scene) rootFlags |= ImGuiTreeNodeFlags_Selected;
         if (ImGui::TreeNodeEx("Scene", rootFlags)) {
+            // Click on "Scene" label to select scene-level settings
+            if (ImGui::IsItemClicked()) {
+                selectedEntity = entt::null;
+                selectionType = SelectionType::Scene;
+            }
 
             // Cameras
             auto cameraView = registry->view<CameraComponent, Name>();
@@ -737,10 +1017,14 @@ void UI::drawViewport(vk::DescriptorSet viewportTexture, vk::Extent2D viewportEx
         ImGui::TextColored(hex(0xE8DCC8), "%u", particleCount);
         ImGui::SameLine(0, 20);
 
-        // Resolution
-        ImGui::TextColored(hex(0x8B7D6B), "Res");
+        // Resolution: viewport panel size | render framebuffer size
+        ImGui::TextColored(hex(0x8B7D6B), "Viewport");
         ImGui::SameLine();
-        ImGui::TextColored(hex(0xE8DCC8), "%ux%u", viewportExtent.width, viewportExtent.height);
+        ImGui::TextColored(hex(0xE8DCC8), "%.0fx%.0f", avail.x, avail.y);
+        ImGui::SameLine(0, 10);
+        ImGui::TextColored(hex(0x8B7D6B), "Render");
+        ImGui::SameLine();
+        ImGui::TextColored(hex(0xE8DCC8), "%dx%d", renderWidth, renderHeight);
     } else {
         viewportHovered = false;
     }
@@ -753,6 +1037,47 @@ void UI::drawInspector(uint32_t particleCount,
     ImGui::SetNextWindowSize(ImVec2(280, 500), ImGuiCond_FirstUseEver);
 
     if (ImGui::Begin("Inspector")) {
+        // ── Scene-level settings (no entity selected, Scene root clicked) ──
+        if (selectionType == SelectionType::Scene) {
+            ImGui::TextColored(hex(0xC8A44E), "Scene Settings");
+            ImGui::Separator();
+
+            if (ImGui::CollapsingHeader("Environment", ImGuiTreeNodeFlags_DefaultOpen)) {
+                namespace fs = std::filesystem;
+                std::string filename = envMapPath.empty() ? "(none)" : fs::path(envMapPath).filename().string();
+
+                ImGui::TextColored(hex(0x8B7D6B), "HDR Map");
+                ImGui::SameLine(110);
+                ImGui::TextColored(envMapPath.empty() ? hex(0x5C5347) : hex(0xE8DCC8), "%s", filename.c_str());
+
+                // Clear button
+                if (!envMapPath.empty()) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("x##clear_env")) {
+                        envMapPath.clear();
+                        if (onEnvMapClear) onEnvMapClear();
+                    }
+                }
+
+                // Drag-drop target for .hdr files
+                if (ImGui::BeginDragDropTarget()) {
+                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("KMRB_HDR_PATH")) {
+                        std::string path(static_cast<const char*>(payload->Data));
+                        envMapPath = path;
+                        if (onEnvMapLoad) onEnvMapLoad(path);
+                    }
+                    ImGui::EndDragDropTarget();
+                }
+
+                if (envMapPath.empty()) {
+                    ImGui::TextColored(hex(0x5C5347), "Drag an .hdr file here from the Project Browser");
+                }
+            }
+
+            ImGui::End();
+            return;
+        }
+
         if (!registry || selectedEntity == entt::null || !registry->valid(selectedEntity)) {
             ImGui::TextColored(hex(0x5C5347), "No entity selected");
             ImGui::End();
@@ -854,6 +1179,7 @@ void UI::drawInspector(uint32_t particleCount,
                         }
                     };
 
+                    drawShaderSlot("Init", shaderProg->initPath, ".comp");
                     drawShaderSlot("Compute", shaderProg->computePath, ".comp");
                     drawShaderSlot("Vertex", shaderProg->vertexPath, ".vert");
                     drawShaderSlot("Fragment", shaderProg->fragmentPath, ".frag");
@@ -864,16 +1190,63 @@ void UI::drawInspector(uint32_t particleCount,
                     ImGui::Spacing();
                 }
 
+                // ── Reflected Parameters ──
+                // Auto-generated from shader push constants via SPIRV-Reflect.
+                // Each user-defined param (offset >= 80) gets a matching ImGui widget.
+                // The user can drag sliders or edit values, which writes directly into
+                // the ShaderInstance's pushConstantData buffer — picked up by the GPU next frame.
+                if (shaderInstancesPtr) {
+                    auto* instances = static_cast<std::unordered_map<uint32_t, Renderer::ShaderInstance>*>(shaderInstancesPtr);
+                    uint32_t entityKey = static_cast<uint32_t>(selectedEntity);
+                    auto instIt = instances->find(entityKey);
+                    if (instIt != instances->end()) {
+                        auto& inst = instIt->second;
+                        if (!inst.reflectedParams.empty()) {
+                            ImGui::Spacing();
+                            ImGui::TextColored(hex(0xC8A44E), "Parameters");
 
-                if (gpuSupportsF64) {
-                    if (ImGui::Checkbox("Float64 (double precision)", &f64Enabled)) {
-                        Log::info(f64Enabled ? "Float64 ENABLED" : "Float64 DISABLED");
+                            for (size_t pi = 0; pi < inst.reflectedParams.size(); pi++) {
+                                auto& param = inst.reflectedParams[pi];
+                                // Get a pointer into the live push constant data at this param's offset
+                                uint8_t* raw = inst.pushConstantData.data() + param.offset;
+
+                                // Each widget needs a unique ImGui ID — use offset to guarantee uniqueness
+                                ImGui::PushID(static_cast<int>(param.offset));
+
+                                switch (param.type) {
+                                    case Renderer::ReflectedParam::Float:
+                                        ImGui::DragFloat(param.name.c_str(), reinterpret_cast<float*>(raw), 0.01f);
+                                        break;
+                                    case Renderer::ReflectedParam::Vec2:
+                                        ImGui::DragFloat2(param.name.c_str(), reinterpret_cast<float*>(raw), 0.01f);
+                                        break;
+                                    case Renderer::ReflectedParam::Vec3:
+                                        ImGui::DragFloat3(param.name.c_str(), reinterpret_cast<float*>(raw), 0.01f);
+                                        break;
+                                    case Renderer::ReflectedParam::Vec4:
+                                        ImGui::DragFloat4(param.name.c_str(), reinterpret_cast<float*>(raw), 0.01f);
+                                        break;
+                                    case Renderer::ReflectedParam::Int:
+                                        ImGui::DragInt(param.name.c_str(), reinterpret_cast<int*>(raw));
+                                        break;
+                                    case Renderer::ReflectedParam::Bool:
+                                        ImGui::Checkbox(param.name.c_str(), reinterpret_cast<bool*>(raw));
+                                        break;
+                                    case Renderer::ReflectedParam::Mat4:
+                                        // Matrices are not easily editable — just show the name
+                                        ImGui::TextColored(hex(0x5C5347), "%s (mat4)", param.name.c_str());
+                                        break;
+                                    default:
+                                        ImGui::TextColored(hex(0x5C5347), "%s (unsupported type)", param.name.c_str());
+                                        break;
+                                }
+
+                                ImGui::PopID();
+                            }
+                        }
                     }
-                } else {
-                    ImGui::TextColored(hex(0xD46B5A), "Float64 not supported");
                 }
 
-                ImGui::Spacing();
 
                 auto formatSize = [](vk::DeviceSize bytes) -> std::string {
                     if (bytes >= 1024 * 1024)
@@ -898,7 +1271,7 @@ void UI::drawInspector(uint32_t particleCount,
 
                     ImGui::TextColored(hex(0x8B7D6B), "Precision");
                     ImGui::SameLine(110);
-                    ImGui::TextColored(hex(0xE8DCC8), "%s", f64Enabled ? "float64" : "float32");
+                    ImGui::TextColored(hex(0xE8DCC8), "float32");
                 }
 
                 ImGui::Spacing();
@@ -1167,6 +1540,74 @@ void UI::drawDataOutput() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PREFERENCES WINDOW
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+void UI::drawPreferences() {
+    // Centered, non-docked window — behaves like a modal settings dialog
+    ImGui::SetNextWindowSize(ImVec2(450, 350), ImGuiCond_FirstUseEver);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoCollapse;
+
+    if (ImGui::Begin("Preferences", &showPreferences, flags)) {
+
+        // ── Rendering ──
+        if (ImGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextColored(hex(0x8B7D6B), "Resolution");
+            ImGui::SameLine(160);
+            ImGui::SetNextItemWidth(80);
+            if (ImGui::InputInt("##res_w", &renderWidth, 0, 0)) renderResDirty = true;
+            ImGui::SameLine();
+            ImGui::TextColored(hex(0x5C5347), "x");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80);
+            if (ImGui::InputInt("##res_h", &renderHeight, 0, 0)) renderResDirty = true;
+            renderWidth = std::clamp(renderWidth, 320, 7680);
+            renderHeight = std::clamp(renderHeight, 240, 4320);
+            ImGui::TextColored(hex(0x5C5347), "  Offscreen framebuffer size. Affects GPU load.");
+
+            ImGui::Spacing();
+
+            ImGui::TextColored(hex(0x8B7D6B), "Particle Count");
+            ImGui::SameLine(160);
+            ImGui::SetNextItemWidth(-1);
+            int prev = particleCount;
+            ImGui::InputInt("##particle_count", &particleCount, 1000, 10000);
+            particleCount = std::clamp(particleCount, 100, 1000000);
+            if (particleCount != prev) particleCountDirty = true;
+            ImGui::TextColored(hex(0x5C5347), "  Max particles in the SSBO. Init shader fills up to this count.");
+        }
+
+        ImGui::Spacing();
+
+        // ── Camera ──
+        if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextColored(hex(0x8B7D6B), "Move Speed");
+            ImGui::SameLine(160);
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##cam_speed", &cameraMoveSpeed, 0.5f, 50.0f, "%.1f");
+
+            ImGui::TextColored(hex(0x8B7D6B), "Look Sensitivity");
+            ImGui::SameLine(160);
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##cam_sens", &cameraLookSensitivity, 0.01f, 0.5f, "%.2f");
+        }
+
+        ImGui::Spacing();
+
+        // ── Data ──
+        if (ImGui::CollapsingHeader("Data Output", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextColored(hex(0x8B7D6B), "Refresh Interval");
+            ImGui::SameLine(160);
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##data_refresh", &dataRefreshInterval, 0.1f, 5.0f, "%.1f s");
+
+            ImGui::Checkbox("Auto-refresh Buffer Table", &dataAutoRefresh);
+        }
+    }
+    ImGui::End();
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // LOG SYSTEM
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1259,7 +1700,7 @@ void UI::saveScene(const std::string& path) {
     f << "  \"name\": \"" << std::filesystem::path(path).stem().string() << "\",\n";
     f << "  \"shader\": \"compute\",\n";
     f << "  \"particles\": 10000,\n";
-    f << "  \"precision\": \"" << (f64Enabled ? "float64" : "float32") << "\"\n";
+    f << "  \"precision\": \"float32\"\n";
     f << "}\n";
     f.close();
 

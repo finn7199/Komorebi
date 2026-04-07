@@ -38,6 +38,46 @@ public:
     const BufferManager& getBufferManager() const { return bufferManager; }
     BufferManager& getBufferManager() { return bufferManager; }
     UI& getUI() { return ui; }
+    void* getShaderInstancesPtr() { return &shaderInstances; }
+
+    // Environment map — called by Core via UI callback
+    void loadEnvMap(vk::Device device, const std::string& path) { loadEnvironmentMap(device, path); }
+    void clearEnvMap(vk::Device device) { destroyEnvironmentMap(device); }
+
+    // Re-run init shaders on next frame (called after simulation reset)
+    void requestInitDispatch() {
+        for (auto& [key, inst] : shaderInstances) {
+            if (inst.initPipeline) inst.initPending = true;
+        }
+    }
+
+    // A single tweakable parameter extracted from shader push constants via SPIRV-Reflect.
+    // The Inspector uses this to auto-generate UI widgets (sliders, checkboxes, etc.)
+    // so users can tweak shader behavior without editing GLSL.
+    struct ReflectedParam {
+        std::string name;       // GLSL variable name, e.g. "gravity", "damping"
+        uint32_t offset;        // Byte offset within push constant block
+        uint32_t size;          // Size in bytes (4 for float, 12 for vec3, etc.)
+        enum Type { Float, Vec2, Vec3, Vec4, Int, Bool, Mat4, Unknown } type;
+    };
+
+    // Per-entity shader instances — replaces singleton pipelines.
+    // Each Pipeline entity gets its own compiled Vulkan pipelines, reflected params,
+    // and live push constant data buffer that the Inspector can write into.
+    struct ShaderInstance {
+        entt::entity owner = entt::null;
+        vk::Pipeline initPipeline = nullptr;     // One-shot: runs once to set up initial particle positions
+        vk::Pipeline computePipeline = nullptr;  // Per-frame: runs every frame for simulation
+        vk::Pipeline graphicsPipeline = nullptr;
+        std::string initPath, computePath, vertexPath, fragmentPath;
+        std::filesystem::file_time_type initModTime{}, compModTime{}, vertModTime{}, fragModTime{};
+        bool initPending = false;                // True = init shader needs to dispatch (once)
+
+        // Reflection data — populated by reflectPushConstants() after SPIR-V compilation
+        std::vector<ReflectedParam> reflectedParams;   // User-tweakable params (excludes engine built-ins)
+        std::vector<uint8_t> pushConstantData;          // Live values written to GPU each frame
+        uint32_t pushConstantSize = 0;                  // Total push constant block size in bytes
+    };
 
 private:
     vk::PhysicalDevice physicalDevice;
@@ -52,16 +92,17 @@ private:
 
     vk::PipelineLayout pipelineLayout;
     vk::Pipeline gridPipeline;        // Lines — grid rendering (always present)
+    vk::Pipeline skyboxPipeline = nullptr;  // Fullscreen skybox rendering
 
-    // Per-entity shader instances — replaces singleton pipelines
-    struct ShaderInstance {
-        entt::entity owner = entt::null;
-        vk::Pipeline computePipeline = nullptr;
-        vk::Pipeline graphicsPipeline = nullptr;
-        std::string computePath, vertexPath, fragmentPath;
-        std::filesystem::file_time_type compModTime{}, vertModTime{}, fragModTime{};
-    };
     std::unordered_map<uint32_t, ShaderInstance> shaderInstances;
+
+    // ── Environment Map (scene-level skybox + shader-accessible cubemap) ──
+    vk::Image envCubemap = nullptr;
+    vk::DeviceMemory envCubemapMemory = nullptr;
+    vk::ImageView envCubemapView = nullptr;
+    vk::Sampler envSampler = nullptr;
+    vk::DescriptorSet envDescriptorSet = nullptr;   // Set 1: environment cubemap
+    bool envMapLoaded = false;
 
     // ── Offscreen Framebuffer (simulation viewport) ──
     vk::Image offscreenColor;
@@ -109,11 +150,11 @@ private:
     uint32_t currentFrame = 0;
     uint32_t imageCount = 0;
     uint32_t graphicsQueueFamily = 0;
-    vk::Extent2D extent;
+    vk::Extent2D extent;          // Swapchain size (full window)
+    vk::Extent2D renderExtent;    // Offscreen framebuffer size (set in Preferences)
     float elapsedTime = 0.0f;
     float computeTime = 0.0f;
 
-    bool currentF64 = false;
 
     // ── Init Helpers ──
     uint32_t gridVertexCount = 0;
@@ -145,9 +186,19 @@ private:
     vk::Pipeline buildComputePipeline(vk::Device device, const std::string& path);
     vk::Pipeline buildGraphicsPipeline(vk::Device device, const std::string& vertPath, const std::string& fragPath);
 
+    // SPIRV-Reflect: extract push constant members from compiled SPIR-V bytecode.
+    // Populates inst.reflectedParams with user-tweakable params (skips engine built-ins like model/color).
+    void reflectPushConstants(const std::vector<uint32_t>& spirv, ShaderInstance& inst);
+
+    // Environment map — load HDR, create cubemap, bind to Set 1
+    void loadEnvironmentMap(vk::Device device, const std::string& hdrPath);
+    void destroyEnvironmentMap(vk::Device device);
+    void createSkyboxPipeline(vk::Device device);
+    void createPlaceholderCubemap(vk::Device device);  // 1x1 black cubemap for unbound state
+
     vk::ShaderModule createShaderModule(vk::Device device, const std::vector<char>& code);
     static std::vector<char> readFile(const std::string& filename);
-    static std::vector<uint32_t> compileGLSL(const std::string& sourcePath, bool useF64 = false);
+    static std::vector<uint32_t> compileGLSL(const std::string& sourcePath);
 };
 
 } // namespace kmrb

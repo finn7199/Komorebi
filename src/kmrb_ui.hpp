@@ -18,7 +18,7 @@ namespace kmrb {
 struct BufferInfo; // Forward declare
 
 // What kind of entity is selected in the hierarchy
-enum class SelectionType { None, Pipeline, Camera, Grid };
+enum class SelectionType { None, Scene, Pipeline, Camera, Grid };
 
 // Log levels matching the KMRB color palette
 enum class LogLevel { Info, Ok, Warn, Error };
@@ -70,15 +70,36 @@ public:
     void setProjectRoot(const std::string& root) { projectRoot = root; }
     void setOnReset(std::function<void()> cb) { onReset = std::move(cb); }
     void setOnExportCSV(std::function<void(const std::string&)> cb) { onExportCSV = std::move(cb); }
-    void setGPUSupportsF64(bool supported) { gpuSupportsF64 = supported; }
+    void setOnEnvMapLoad(std::function<void(const std::string&)> cb) { onEnvMapLoad = std::move(cb); }
+    void setOnEnvMapClear(std::function<void()> cb) { onEnvMapClear = std::move(cb); }
+    void setOnReloadShaders(std::function<void()> cb) { onReloadShaders = std::move(cb); }
+
+    // Simulation state — read by renderer to gate compute dispatch
+    bool shouldDispatchCompute() {
+        if (simRunning) return true;
+        if (stepRequested) { stepRequested = false; return true; }
+        return false;
+    }
     void setWindow(GLFWwindow* w) { glfwWindow = w; }
     void setRegistry(entt::registry* reg) { registry = reg; }
     void setBufferManager(BufferManager* bm) { bufferManager = bm; }
 
+    // Shader instances map — gives the Inspector access to reflected push constant
+    // params so it can auto-generate UI widgets. Set by Core after renderer init.
+    // Stored as void* to avoid circular header dependency (Renderer → UI → Renderer).
+    // Cast to std::unordered_map<uint32_t, Renderer::ShaderInstance>* in kmrb_ui.cpp.
+    void setShaderInstances(void* si) { shaderInstancesPtr = si; }
+
     // Inspector state — read by renderer/core
 
-    bool isF64Enabled() const { return f64Enabled; }
     SelectionType getSelectionType() const { return selectionType; }
+    float getCameraMoveSpeed() const { return cameraMoveSpeed; }
+    float getCameraLookSensitivity() const { return cameraLookSensitivity; }
+    int getRenderWidth() const { return renderWidth; }
+    int getRenderHeight() const { return renderHeight; }
+    int getParticleCount() const { return particleCount; }
+    bool isRenderResolutionDirty() { bool d = renderResDirty; renderResDirty = false; return d; }
+    bool isParticleCountDirty() { bool d = particleCountDirty; particleCountDirty = false; return d; }
 
     // Handle swapchain recreation
     void onSwapchainRecreate(uint32_t newImageCount);
@@ -87,12 +108,20 @@ private:
     vk::DescriptorPool imguiPool;
 
     bool showDemoWindow = false;
+    bool showPreferences = false;
     bool viewportHovered = false;
     std::string projectRoot;
     std::string selectedFile;
     std::function<void()> onReset;
     std::function<void(const std::string&)> onExportCSV;
+    std::function<void(const std::string&)> onEnvMapLoad;
+    std::function<void()> onEnvMapClear;
+    std::function<void()> onReloadShaders;
     GLFWwindow* glfwWindow = nullptr;
+
+    // Simulation playback state
+    bool simRunning = true;
+    bool stepRequested = false;
 
     // Scene state
     std::string currentScenePath;
@@ -101,8 +130,21 @@ private:
 
     // Inspector state
 
-    bool f64Enabled = false;
-    bool gpuSupportsF64 = false;
+
+    // Shader reflection — opaque pointer to Renderer's shaderInstances map
+    void* shaderInstancesPtr = nullptr;
+
+    // Preferences
+    int renderWidth = 1920;
+    int renderHeight = 1080;
+    bool renderResDirty = false;
+    float cameraMoveSpeed = 5.0f;
+    float cameraLookSensitivity = 0.15f;
+    int particleCount = 10000;
+    bool particleCountDirty = false;
+
+    // Environment map — scene-level property
+    std::string envMapPath;
 
     // Data Output panel state
     BufferManager* bufferManager = nullptr;
@@ -132,6 +174,7 @@ private:
                        const std::unordered_map<std::string, BufferInfo>& buffers);
     void drawConsole();
     void drawDataOutput();
+    void drawPreferences();
 
     // File dialog helpers (Windows native)
     std::string openFileDialog(const char* filter, const char* title);

@@ -40,10 +40,12 @@ struct PipelineComponent {
     uint32_t particleCount = 10000;
 };
 
-// Shader program — attached to any entity that runs GPU programs
-// Compute + vertex + fragment slots. Set dirty=true to trigger pipeline rebuild.
+// Shader program — attached to any entity that runs GPU programs.
+// Four slots: init (runs once), compute (runs every frame), vertex + fragment (rendering).
+// Set dirty=true to trigger pipeline rebuild.
 struct ShaderProgramComponent {
-    std::string computePath;     // e.g., "shaders/compute/gravity.comp"
+    std::string initPath;        // One-shot compute shader for particle initialization
+    std::string computePath;     // Per-frame compute shader, e.g., "shaders/compute/gravity.comp"
     std::string vertexPath;      // e.g., "shaders/render/particle.vert"
     std::string fragmentPath;    // e.g., "shaders/render/particle.frag"
     bool dirty = true;           // Set by UI/hot-reload, cleared after pipeline rebuild

@@ -24,6 +24,7 @@ void Core::init() {
     registry.emplace<Transform>(pipeline);
     registry.emplace<PipelineComponent>(pipeline, PipelineComponent{10000});
     registry.emplace<ShaderProgramComponent>(pipeline, ShaderProgramComponent{
+        KMRB_SHADER_DIR "/compute/default_init.comp",
         KMRB_SHADER_DIR "/compute/gravity.comp",
         KMRB_SHADER_DIR "/../shaders/render/particle.vert",
         KMRB_SHADER_DIR "/../shaders/render/particle.frag",
@@ -63,6 +64,7 @@ void Core::init() {
         sim.init(registry, 10000);
         auto particles = sim.syncToSSBO(registry);
         renderer.uploadParticles(device, particles);
+        renderer.requestInitDispatch();  // Re-run init shaders if assigned
         kmrb::Log::ok("Simulation reset");
     });
     renderer.getUI().setOnExportCSV([this](const std::string& path) {
@@ -73,9 +75,23 @@ void Core::init() {
             "r", "g", "b", "a"
         });
     });
+    renderer.getUI().setOnReloadShaders([this]() {
+        device.waitIdle();
+        // Mark all shader instances dirty so they recompile next sync
+        auto view = registry.view<ShaderProgramComponent>();
+        for (auto e : view) view.get<ShaderProgramComponent>(e).dirty = true;
+        kmrb::Log::info("Force recompiling all shaders...");
+    });
+    renderer.getUI().setOnEnvMapLoad([this](const std::string& path) {
+        renderer.loadEnvMap(device, path);
+    });
+    renderer.getUI().setOnEnvMapClear([this]() {
+        renderer.clearEnvMap(device);
+    });
     renderer.getUI().setWindow(window);
     renderer.getUI().setRegistry(&registry);
     renderer.getUI().setBufferManager(&renderer.getBufferManager());
+    renderer.getUI().setShaderInstances(renderer.getShaderInstancesPtr());
     renderer.setRegistry(&registry);
 }
 
@@ -265,10 +281,6 @@ void Core::createLogicalDevice() {
     // Enable required features
     vk::PhysicalDeviceFeatures supportedFeatures = physicalDevice.getFeatures();
     vk::PhysicalDeviceFeatures deviceFeatures{};
-    if (supportedFeatures.shaderFloat64) {
-        deviceFeatures.shaderFloat64 = VK_TRUE;
-        kmrb::Log::info("shaderFloat64 enabled");
-    }
 
     // Vulkan 1.3 features — needed for runtime-compiled shaders that use 1.3 capabilities
     vk::PhysicalDeviceVulkan13Features features13{};

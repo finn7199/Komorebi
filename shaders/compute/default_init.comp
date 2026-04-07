@@ -1,0 +1,82 @@
+#version 450
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DEFAULT INIT SHADER — sets up particles in a random sphere distribution.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// This shader runs ONCE when:
+//   - The Pipeline entity is first created
+//   - The simulation is reset (Simulation > Restart)
+//   - This file is modified (hot-reload)
+//
+// It writes initial positions, velocities, and colors to the output SSBO.
+// The compute shader (gravity.comp, vortex.comp, etc.) takes over from here,
+// updating particles every frame.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) uniform GlobalUBO {
+    mat4 view;
+    mat4 proj;
+    vec4 cameraPos;
+    float time;
+    float deltaTime;
+} global;
+
+struct Particle {
+    vec4 position;  // xyz = pos, w = point size
+    vec4 velocity;  // xyz = vel, w = lifetime
+    vec4 color;     // rgba
+};
+
+layout(set = 2, binding = 0) readonly buffer ParticleInput {
+    Particle particles[];
+} ssboIn;
+
+layout(set = 2, binding = 1) writeonly buffer ParticleOutput {
+    Particle particles[];
+} ssboOut;
+
+// Pseudo-random number from particle index (deterministic, reproducible)
+float hash(uint n) {
+    n = (n << 13u) ^ n;
+    n = n * (n * n * 15731u + 789221u) + 1376312589u;
+    return float(n & 0x7fffffffu) / float(0x7fffffff);
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= ssboIn.particles.length()) return;
+
+    Particle p;
+
+    // Three random values per particle, seeded by index
+    float r1 = hash(index * 3u + 0u);
+    float r2 = hash(index * 3u + 1u);
+    float r3 = hash(index * 3u + 2u);
+
+    // Uniform distribution inside a sphere (radius 1.5)
+    float theta = r1 * 6.28318;            // Azimuth: 0 to 2*pi
+    float phi = acos(1.0 - 2.0 * r2);     // Polar: uniform on sphere surface
+    float radius = 1.5 * pow(r3, 0.333);  // Cube root for uniform volume fill
+
+    p.position.xyz = vec3(
+        radius * sin(phi) * cos(theta),
+        radius * sin(phi) * sin(theta),
+        radius * cos(phi)
+    );
+    p.position.w = 2.0;  // Point size
+
+    p.velocity = vec4(0.0);  // Start at rest
+
+    // Color: purple-blue tint, brighter toward the edges
+    float t = radius / 1.5;
+    p.color = vec4(
+        0.4 + 0.6 * t,
+        0.2 + 0.3 * (1.0 - t),
+        0.8,
+        1.0
+    );
+
+    ssboOut.particles[index] = p;
+}

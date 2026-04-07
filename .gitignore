@@ -17,6 +17,13 @@ cmake-build-*/
 # Claude Code
 .claude/
 
+# Test assets (HDR environment maps, 3D models, textures)
+*.hdr
+*.fbx
+*.obj
+*.gltf
+*.glb
+
 # OS
 Thumbs.db
 Desktop.ini
