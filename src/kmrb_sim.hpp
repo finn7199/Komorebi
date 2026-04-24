@@ -58,13 +58,17 @@ struct GridComponent {
     glm::vec4 color = { 0.24f, 0.21f, 0.16f, 1.0f };
 };
 
-// Mesh renderer — V1: wireframe primitives. V2: full PBR meshes.
-enum class PrimitiveShape { Cube, Sphere, Plane };
+// Mesh renderer — holds a loaded 3D model and user-assignable shaders.
+// The entity is a holder: swap the mesh file to change the model,
+// swap the shaders to change how it's rendered.
 struct MeshRendererComponent {
-    PrimitiveShape shape = PrimitiveShape::Cube;
+    std::string meshPath;               // Path to .fbx/.obj/.gltf/.glb file
+    std::string vertexShaderPath;       // User vertex shader (empty = engine default)
+    std::string fragmentShaderPath;     // User fragment shader (empty = engine default)
     glm::vec4 color = { 0.6f, 0.6f, 0.6f, 1.0f };
-    bool wireframe = true;
-    // V2: materialID, mesh asset path, etc.
+    bool wireframe = false;
+    bool shaderDirty = true;            // Set by UI/hot-reload, cleared after pipeline rebuild
+    std::string meshCacheKey;           // Runtime: key into MeshCache (not serialized)
 };
 
 // Light — stub for V2 lighting

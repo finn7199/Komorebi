@@ -7,6 +7,7 @@
 
 #include "kmrb_types.hpp"
 #include "kmrb_buffers.hpp"
+#include "kmrb_mesh.hpp"
 #include "kmrb_ui.hpp"
 #include "kmrb_camera.hpp"
 #include "kmrb_sim.hpp"
@@ -39,6 +40,8 @@ public:
     BufferManager& getBufferManager() { return bufferManager; }
     UI& getUI() { return ui; }
     void* getShaderInstancesPtr() { return &shaderInstances; }
+    void* getMeshInstancesPtr() { return &meshInstances; }
+    MeshCache& getMeshCache() { return meshCache; }
 
     // Environment map — called by Core via UI callback
     void loadEnvMap(vk::Device device, const std::string& path) { loadEnvironmentMap(device, path); }
@@ -79,6 +82,20 @@ public:
         uint32_t pushConstantSize = 0;                  // Total push constant block size in bytes
     };
 
+    // Per-mesh-entity shader instance — simpler than particle ShaderInstance (no compute/init).
+    // Each Mesh entity gets its own graphics pipeline built from user-assignable vert/frag shaders.
+    struct MeshShaderInstance {
+        entt::entity owner = entt::null;
+        vk::Pipeline graphicsPipeline = nullptr;
+        std::string vertexPath, fragmentPath;
+        std::filesystem::file_time_type vertModTime{}, fragModTime{};
+        bool wireframe = false;
+
+        std::vector<ReflectedParam> reflectedParams;
+        std::vector<uint8_t> pushConstantData;
+        uint32_t pushConstantSize = 0;
+    };
+
 private:
     vk::PhysicalDevice physicalDevice;
     GLFWwindow* cachedWindow = nullptr;
@@ -95,6 +112,8 @@ private:
     vk::Pipeline skyboxPipeline = nullptr;  // Fullscreen skybox rendering
 
     std::unordered_map<uint32_t, ShaderInstance> shaderInstances;
+    std::unordered_map<uint32_t, MeshShaderInstance> meshInstances;
+    MeshCache meshCache;
 
     // ── Environment Map (scene-level skybox + shader-accessible cubemap) ──
     vk::Image envCubemap = nullptr;
@@ -185,6 +204,12 @@ private:
     void destroyShaderInstance(vk::Device device, ShaderInstance& inst);
     vk::Pipeline buildComputePipeline(vk::Device device, const std::string& path);
     vk::Pipeline buildGraphicsPipeline(vk::Device device, const std::string& vertPath, const std::string& fragPath);
+
+    // Mesh instance management — syncs MeshRendererComponents to Vulkan pipelines
+    void syncMeshInstances(vk::Device device);
+    void destroyMeshInstance(vk::Device device, MeshShaderInstance& inst);
+    vk::Pipeline buildMeshGraphicsPipeline(vk::Device device, const std::string& vertPath,
+                                           const std::string& fragPath, bool wireframe);
 
     // SPIRV-Reflect: extract push constant members from compiled SPIR-V bytecode.
     // Populates inst.reflectedParams with user-tweakable params (skips engine built-ins like model/color).

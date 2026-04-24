@@ -20,8 +20,23 @@ enum DescriptorSet : uint32_t {
 };
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LIGHTS (packed into Global UBO for shader access)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+static constexpr uint32_t MAX_LIGHTS = 8;
+
+// 64 bytes per light, std140 aligned. Matches the GLSL struct in user shaders.
+struct GPULight {
+    glm::vec4 positionAndType;      // xyz = world position, w = type (0=point, 1=directional, 2=spot)
+    glm::vec4 directionAndAngle;    // xyz = direction, w = cos(spot angle)
+    glm::vec4 colorAndIntensity;    // xyz = color, w = intensity
+    glm::vec4 params;               // x = radius, yzw = reserved
+};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // GLOBAL UBO (Set 0, Binding 0)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// New fields (lights) are appended AFTER existing ones so that older shaders
+// that declare the smaller struct continue to work — they just ignore the tail.
 struct GlobalUBO {
     glm::mat4 view;
     glm::mat4 proj;
@@ -29,6 +44,11 @@ struct GlobalUBO {
     float time;
     float deltaTime;
     float padding[2];       // Align to 16 bytes (std140 layout rules)
+
+    // Light array — user shaders loop over lights[0..lightCount-1]
+    GPULight lights[MAX_LIGHTS];
+    int lightCount;
+    float lightPadding[3];  // Pad to 16-byte boundary
 };
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -57,8 +77,7 @@ struct Particle {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // VERTEX FORMATS
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// V1: position + color. V2: position + normal + uv + tangent.
-// Configurable — pipeline takes binding/attribute descriptions
+// Simple vertex — used by grid lines (position + color)
 struct Vertex {
     glm::vec3 position;
     glm::vec3 color;
@@ -75,14 +94,24 @@ struct Vertex {
     }
 };
 
-// V2 will add:
-// struct MeshVertex {
-//     glm::vec3 position;
-//     glm::vec3 normal;
-//     glm::vec2 uv;
-//     glm::vec4 tangent;
-//     static binding/attribute descriptions...
-// };
+// Mesh vertex — used by 3D models loaded via Assimp (position + normal + UV)
+struct MeshVertex {
+    glm::vec3 position;
+    glm::vec3 normal;
+    glm::vec2 uv;
+
+    static vk::VertexInputBindingDescription getBindingDescription() {
+        return { 0, sizeof(MeshVertex), vk::VertexInputRate::eVertex };
+    }
+
+    static std::array<vk::VertexInputAttributeDescription, 3> getAttributeDescriptions() {
+        return {{
+            { 0, 0, vk::Format::eR32G32B32Sfloat, offsetof(MeshVertex, position) },
+            { 1, 0, vk::Format::eR32G32B32Sfloat, offsetof(MeshVertex, normal) },
+            { 2, 0, vk::Format::eR32G32Sfloat, offsetof(MeshVertex, uv) }
+        }};
+    }
+};
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // RENDER PASS CONFIG

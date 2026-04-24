@@ -18,7 +18,7 @@ namespace kmrb {
 struct BufferInfo; // Forward declare
 
 // What kind of entity is selected in the hierarchy
-enum class SelectionType { None, Scene, Pipeline, Camera, Grid };
+enum class SelectionType { None, Scene, Pipeline, Camera, Grid, Mesh, Light };
 
 // Log levels matching the KMRB color palette
 enum class LogLevel { Info, Ok, Warn, Error };
@@ -89,6 +89,7 @@ public:
     // Stored as void* to avoid circular header dependency (Renderer → UI → Renderer).
     // Cast to std::unordered_map<uint32_t, Renderer::ShaderInstance>* in kmrb_ui.cpp.
     void setShaderInstances(void* si) { shaderInstancesPtr = si; }
+    void setMeshInstances(void* mi) { meshInstancesPtr = mi; }
 
     // Inspector state — read by renderer/core
 
@@ -131,8 +132,9 @@ private:
     // Inspector state
 
 
-    // Shader reflection — opaque pointer to Renderer's shaderInstances map
+    // Shader reflection — opaque pointers to Renderer's instance maps
     void* shaderInstancesPtr = nullptr;
+    void* meshInstancesPtr = nullptr;
 
     // Preferences
     int renderWidth = 1920;

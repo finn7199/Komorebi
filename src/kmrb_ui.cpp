@@ -482,8 +482,9 @@ void UI::drawMenuBar() {
 
             if (ImGui::MenuItem("Import File...")) {
                 std::string path = openFileDialog(
-                    "All Supported\0*.comp;*.vert;*.frag;*.glsl;*.hdr;*.kmrb\0"
+                    "All Supported\0*.comp;*.vert;*.frag;*.glsl;*.hdr;*.fbx;*.obj;*.gltf;*.glb;*.kmrb\0"
                     "Shaders (*.comp;*.vert;*.frag)\0*.comp;*.vert;*.frag\0"
+                    "3D Models (*.fbx;*.obj;*.gltf;*.glb)\0*.fbx;*.obj;*.gltf;*.glb\0"
                     "HDR Images (*.hdr)\0*.hdr\0"
                     "All Files\0*.*\0",
                     "Import File");
@@ -492,10 +493,12 @@ void UI::drawMenuBar() {
                     std::string ext = fs::path(path).extension().string();
                     std::string filename = fs::path(path).filename().string();
 
-                    // Route shaders to their subdirectories, everything else to project root
+                    // Route files to their subdirectories
                     std::string destDir;
                     if (ext == ".comp") destDir = projectRoot + "/shaders/compute";
                     else if (ext == ".vert" || ext == ".frag") destDir = projectRoot + "/shaders/render";
+                    else if (ext == ".fbx" || ext == ".obj" || ext == ".gltf" || ext == ".glb")
+                        destDir = projectRoot + "/models";
                     else destDir = projectRoot;
 
                     fs::create_directories(destDir);
@@ -589,6 +592,13 @@ void UI::drawProjectBrowser() {
                 ImGui::TreePop();
             }
 
+            // Models folder
+            std::string modelsDir = projectRoot + "/models";
+            if (fs::exists(modelsDir) && ImGui::TreeNodeEx("models", ImGuiTreeNodeFlags_DefaultOpen)) {
+                drawFileTree(modelsDir);
+                ImGui::TreePop();
+            }
+
             // Root-level asset files (HDR images, etc.) — shown without a subfolder.
             // Only shows supported file types, skips directories.
             for (auto& entry : fs::directory_iterator(projectRoot)) {
@@ -657,9 +667,10 @@ void UI::drawFileTree(const std::string& directory) {
             folders.push_back(entry);
         } else {
             auto ext = entry.path().extension().string();
-            // Only show shader, scene, and HDR files
+            // Only show shader, scene, HDR, and mesh files
             if (ext == ".comp" || ext == ".vert" || ext == ".frag"
-                || ext == ".glsl" || ext == ".kmrb" || ext == ".ksfx" || ext == ".hdr") {
+                || ext == ".glsl" || ext == ".kmrb" || ext == ".ksfx" || ext == ".hdr"
+                || ext == ".fbx" || ext == ".obj" || ext == ".gltf" || ext == ".glb") {
                 files.push_back(entry);
             }
         }
@@ -696,6 +707,8 @@ void UI::drawFileTree(const std::string& directory) {
             ImGui::PushStyleColor(ImGuiCol_Text, hex(0x5A9BD4));  // Blue for render shaders
         } else if (ext == ".hdr") {
             ImGui::PushStyleColor(ImGuiCol_Text, hex(0x5AAFCC));  // Cyan for HDR env maps
+        } else if (ext == ".fbx" || ext == ".obj" || ext == ".gltf" || ext == ".glb") {
+            ImGui::PushStyleColor(ImGuiCol_Text, hex(0xB8A47C));  // Warm tan for 3D models
         } else {
             ImGui::PushStyleColor(ImGuiCol_Text, hex(0xE8DCC8));  // Primary text
         }
@@ -716,6 +729,15 @@ void UI::drawFileTree(const std::string& directory) {
             if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
                 ImGui::SetDragDropPayload("KMRB_HDR_PATH", fullPath.c_str(), fullPath.size() + 1);
                 ImGui::TextColored(hex(0x5AAFCC), "%s", name.c_str());
+                ImGui::EndDragDropSource();
+            }
+        }
+
+        // Drag-drop source for mesh files — drag onto Mesh entity Inspector slot
+        if (ext == ".fbx" || ext == ".obj" || ext == ".gltf" || ext == ".glb") {
+            if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+                ImGui::SetDragDropPayload("KMRB_MESH_PATH", fullPath.c_str(), fullPath.size() + 1);
+                ImGui::TextColored(hex(0xB8A47C), "%s", name.c_str());
                 ImGui::EndDragDropSource();
             }
         }
@@ -888,6 +910,18 @@ void UI::drawSceneHierarchy() {
                 drawEntity(entity, "Grid", SelectionType::Grid);
             }
 
+            // Meshes
+            auto meshView = registry->view<MeshRendererComponent, Name>();
+            for (auto entity : meshView) {
+                drawEntity(entity, "Mesh", SelectionType::Mesh);
+            }
+
+            // Lights
+            auto lightView = registry->view<LightComponent, Name>();
+            for (auto entity : lightView) {
+                drawEntity(entity, "Light", SelectionType::Light);
+            }
+
             ImGui::TreePop();
         }
 
@@ -956,6 +990,36 @@ void UI::drawAddEntityMenu() {
 
             selectedEntity = entity;
             selectionType = SelectionType::Grid;
+            Log::ok("Created: " + name);
+        }
+
+        if (ImGui::MenuItem("Mesh")) {
+            auto entity = registry->create();
+            int count = 0;
+            registry->view<MeshRendererComponent>().each([&](auto) { count++; });
+            std::string name = count == 0 ? "Mesh" : "Mesh " + std::to_string(count + 1);
+
+            registry->emplace<Name>(entity, name);
+            registry->emplace<Transform>(entity);
+            registry->emplace<MeshRendererComponent>(entity);
+
+            selectedEntity = entity;
+            selectionType = SelectionType::Mesh;
+            Log::ok("Created: " + name);
+        }
+
+        if (ImGui::MenuItem("Light")) {
+            auto entity = registry->create();
+            int count = 0;
+            registry->view<LightComponent>().each([&](auto) { count++; });
+            std::string name = count == 0 ? "Light" : "Light " + std::to_string(count + 1);
+
+            registry->emplace<Name>(entity, name);
+            registry->emplace<Transform>(entity, Transform{{2.0f, 3.0f, 2.0f}, {}, {1.0f, 1.0f, 1.0f}});
+            registry->emplace<LightComponent>(entity);
+
+            selectedEntity = entity;
+            selectionType = SelectionType::Light;
             Log::ok("Created: " + name);
         }
     };
@@ -1294,7 +1358,7 @@ void UI::drawInspector(uint32_t particleCount,
         }
 
 
-        // ── Light (stub for V2) ──
+        // ── Light ──
         auto* light = registry->try_get<LightComponent>(selectedEntity);
         if (light) {
             if (ImGui::CollapsingHeader("Light", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1310,21 +1374,119 @@ void UI::drawInspector(uint32_t particleCount,
                 if (light->type == LightType::Spot) {
                     ImGui::SliderFloat("Spot Angle", &light->spotAngle, 1.0f, 90.0f);
                 }
-                ImGui::TextColored(hex(0x5C5347), "Rendering not implemented (V2)");
             }
         }
 
-        // ── Mesh Renderer (stub for V1 wireframe) ──
-        auto* mesh = registry->try_get<MeshRendererComponent>(selectedEntity);
-        if (mesh) {
+        // ── Mesh Renderer ──
+        auto* meshComp = registry->try_get<MeshRendererComponent>(selectedEntity);
+        if (meshComp) {
             if (ImGui::CollapsingHeader("Mesh Renderer", ImGuiTreeNodeFlags_DefaultOpen)) {
-                const char* shapes[] = { "Cube", "Sphere", "Plane" };
-                int s = static_cast<int>(mesh->shape);
-                ImGui::Combo("Shape", &s, shapes, IM_ARRAYSIZE(shapes));
-                mesh->shape = static_cast<PrimitiveShape>(s);
-                ImGui::ColorEdit4("Color", &mesh->color.x);
-                ImGui::Checkbox("Wireframe", &mesh->wireframe);
-                ImGui::TextColored(hex(0x5C5347), "Rendering not implemented yet");
+                namespace fs = std::filesystem;
+
+                // Mesh file slot — drag-drop target for KMRB_MESH_PATH
+                {
+                    std::string meshLabel = meshComp->meshPath.empty()
+                        ? "(cube primitive)" : fs::path(meshComp->meshPath).filename().string();
+                    ImGui::TextColored(hex(0x8B7D6B), "  Mesh");
+                    ImGui::SameLine(110);
+                    ImGui::TextColored(meshComp->meshPath.empty() ? hex(0x5C5347) : hex(0xE8DCC8),
+                                       "%s", meshLabel.c_str());
+
+                    if (!meshComp->meshPath.empty()) {
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("x##clear_mesh")) {
+                            meshComp->meshPath.clear();
+                            meshComp->meshCacheKey.clear();
+                            meshComp->shaderDirty = true;
+                        }
+                    }
+
+                    if (ImGui::BeginDragDropTarget()) {
+                        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("KMRB_MESH_PATH")) {
+                            std::string droppedPath(static_cast<const char*>(payload->Data));
+                            meshComp->meshPath = droppedPath;
+                            meshComp->meshCacheKey.clear(); // Force reload
+                            meshComp->shaderDirty = true;
+                            Log::ok("Mesh set: " + fs::path(droppedPath).filename().string());
+                        }
+                        ImGui::EndDragDropTarget();
+                    }
+                }
+
+                // Shader slots (Vertex + Fragment) — same drag-drop pattern as Pipeline
+                auto drawMeshShaderSlot = [&](const char* label, std::string& path, const char* ext) {
+                    std::string filename = path.empty() ? "(default)" : fs::path(path).filename().string();
+                    ImGui::TextColored(hex(0x8B7D6B), "  %s", label);
+                    ImGui::SameLine(110);
+                    ImGui::TextColored(path.empty() ? hex(0x5C5347) : hex(0xE8DCC8), "%s", filename.c_str());
+
+                    if (!path.empty()) {
+                        ImGui::SameLine();
+                        std::string clearId = std::string("x##clear_mesh_") + label;
+                        if (ImGui::SmallButton(clearId.c_str())) {
+                            path.clear();
+                            meshComp->shaderDirty = true;
+                        }
+                    }
+
+                    if (ImGui::BeginDragDropTarget()) {
+                        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("KMRB_SHADER_PATH")) {
+                            std::string droppedPath(static_cast<const char*>(payload->Data));
+                            std::string droppedExt = fs::path(droppedPath).extension().string();
+                            if (droppedExt == ext) {
+                                path = droppedPath;
+                                meshComp->shaderDirty = true;
+                                Log::ok("Attached: " + fs::path(droppedPath).filename().string());
+                            } else {
+                                Log::warn("Wrong shader type for this slot");
+                            }
+                        }
+                        ImGui::EndDragDropTarget();
+                    }
+                };
+
+                ImGui::Spacing();
+                ImGui::TextColored(hex(0xC8A44E), "Shaders");
+                drawMeshShaderSlot("Vertex", meshComp->vertexShaderPath, ".vert");
+                drawMeshShaderSlot("Fragment", meshComp->fragmentShaderPath, ".frag");
+
+                ImGui::Spacing();
+                ImGui::TextColored(hex(0xC8A44E), "Material");
+                ImGui::ColorEdit4("Color", &meshComp->color.x);
+                bool wireChanged = ImGui::Checkbox("Wireframe", &meshComp->wireframe);
+                if (wireChanged) meshComp->shaderDirty = true;
+
+                // Reflected push constant parameters (user-defined shader params)
+                if (meshInstancesPtr) {
+                    auto* instances = static_cast<std::unordered_map<uint32_t, Renderer::MeshShaderInstance>*>(meshInstancesPtr);
+                    uint32_t key = static_cast<uint32_t>(selectedEntity);
+                    auto instIt = instances->find(key);
+                    if (instIt != instances->end() && !instIt->second.reflectedParams.empty()) {
+                        ImGui::Spacing();
+                        ImGui::TextColored(hex(0xC8A44E), "Parameters");
+                        auto& inst = instIt->second;
+                        for (auto& param : inst.reflectedParams) {
+                            ImGui::PushID(param.offset);
+                            void* ptr = inst.pushConstantData.data() + param.offset;
+                            switch (param.type) {
+                                case Renderer::ReflectedParam::Float:
+                                    ImGui::DragFloat(param.name.c_str(), (float*)ptr, 0.01f); break;
+                                case Renderer::ReflectedParam::Vec2:
+                                    ImGui::DragFloat2(param.name.c_str(), (float*)ptr, 0.01f); break;
+                                case Renderer::ReflectedParam::Vec3:
+                                    ImGui::DragFloat3(param.name.c_str(), (float*)ptr, 0.01f); break;
+                                case Renderer::ReflectedParam::Vec4:
+                                    ImGui::DragFloat4(param.name.c_str(), (float*)ptr, 0.01f); break;
+                                case Renderer::ReflectedParam::Int:
+                                    ImGui::DragInt(param.name.c_str(), (int*)ptr); break;
+                                case Renderer::ReflectedParam::Bool:
+                                    ImGui::Checkbox(param.name.c_str(), (bool*)ptr); break;
+                                default: break;
+                            }
+                            ImGui::PopID();
+                        }
+                    }
+                }
             }
         }
     }

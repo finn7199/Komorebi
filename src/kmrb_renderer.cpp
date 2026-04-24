@@ -52,6 +52,9 @@ void Renderer::init(GLFWwindow* window, vk::Instance instance,
     createPlaceholderCubemap(device);
     createSkyboxPipeline(device);
 
+    // Load built-in mesh primitives (cube, sphere, plane) so mesh entities work immediately
+    meshCache.loadPrimitives(bufferManager);
+
     ui.init(window, instance, gpu, device, graphicsQueueFamily,
             graphicsQueue, swapchainPass, imageCount);
 
@@ -535,6 +538,30 @@ void Renderer::updateGlobalUBO(uint32_t imageIndex) {
     ubo.time = time;
     elapsedTime = time;
 
+    // Gather lights from ECS into the UBO array so user shaders can read them
+    ubo.lightCount = 0;
+    if (registry) {
+        auto lightView = registry->view<LightComponent, Transform>();
+        for (auto entity : lightView) {
+            if (ubo.lightCount >= static_cast<int>(MAX_LIGHTS)) break;
+            auto& lc = lightView.get<LightComponent>(entity);
+            auto& lt = lightView.get<Transform>(entity);
+
+            GPULight& gpu = ubo.lights[ubo.lightCount];
+            gpu.positionAndType = glm::vec4(lt.position, static_cast<float>(lc.type));
+
+            // Direction from rotation: forward = -Z in local space, rotated by Euler angles
+            float pitch = glm::radians(lt.rotation.x);
+            float yaw   = glm::radians(lt.rotation.y);
+            glm::vec3 dir(cos(pitch) * sin(yaw), -sin(pitch), -cos(pitch) * cos(yaw));
+            gpu.directionAndAngle = glm::vec4(glm::normalize(dir), cos(glm::radians(lc.spotAngle)));
+
+            gpu.colorAndIntensity = glm::vec4(lc.color, lc.intensity);
+            gpu.params = glm::vec4(lc.radius, 0, 0, 0);
+            ubo.lightCount++;
+        }
+    }
+
     std::string name = "global_ubo_" + std::to_string(imageIndex);
     memcpy(bufferManager.getMappedData(name), &ubo, sizeof(ubo));
 }
@@ -697,6 +724,59 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
         cmd.draw(particleCount, 1, 0, 0);
     }
 
+    // ── MESH ENTITIES ──
+    if (registry) {
+        auto meshView = registry->view<MeshRendererComponent, Transform>();
+        for (auto entity : meshView) {
+            auto& meshComp = meshView.get<MeshRendererComponent>(entity);
+            auto& meshTransform = meshView.get<Transform>(entity);
+
+            uint32_t key = static_cast<uint32_t>(entity);
+            auto instIt = meshInstances.find(key);
+            if (instIt == meshInstances.end() || !instIt->second.graphicsPipeline) continue;
+            if (!meshCache.exists(meshComp.meshCacheKey)) continue;
+
+            const auto& gpuMesh = meshCache.get(meshComp.meshCacheKey);
+            auto& inst = instIt->second;
+
+            cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, inst.graphicsPipeline);
+            cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout,
+                DESCRIPTOR_SET_GLOBAL, globalDescriptorSets[imageIndex], nullptr);
+            if (envDescriptorSet) {
+                cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout,
+                    DESCRIPTOR_SET_MATERIAL, envDescriptorSet, nullptr);
+            }
+
+            // Build model matrix from Transform
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), meshTransform.position);
+            model = glm::rotate(model, glm::radians(meshTransform.rotation.y), glm::vec3(0, 1, 0));
+            model = glm::rotate(model, glm::radians(meshTransform.rotation.x), glm::vec3(1, 0, 0));
+            model = glm::rotate(model, glm::radians(meshTransform.rotation.z), glm::vec3(0, 0, 1));
+            model = glm::scale(model, meshTransform.scale);
+
+            if (inst.pushConstantSize > 0) {
+                memcpy(inst.pushConstantData.data(), &model, 64);
+                memcpy(inst.pushConstantData.data() + 64, &meshComp.color, 16);
+                cmd.pushConstants(pipelineLayout,
+                    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eCompute,
+                    0, inst.pushConstantSize, inst.pushConstantData.data());
+            } else {
+                PushConstants push{};
+                push.model = model;
+                push.color = meshComp.color;
+                cmd.pushConstants(pipelineLayout,
+                    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eCompute,
+                    0, sizeof(PushConstants), &push);
+            }
+
+            vk::Buffer vb = bufferManager.getBuffer(gpuMesh.vertexBufferName);
+            vk::DeviceSize offset = 0;
+            cmd.bindVertexBuffers(0, vb, offset);
+            cmd.bindIndexBuffer(bufferManager.getBuffer(gpuMesh.indexBufferName), 0, vk::IndexType::eUint32);
+            cmd.drawIndexed(gpuMesh.indexCount, 1, 0, 0, 0);
+        }
+    }
+
     // ── GRID LINES ──
     if (gridVertexCount > 0 && bufferManager.exists("grid_lines") && registry) {
         cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, gridPipeline);
@@ -758,11 +838,13 @@ bool Renderer::drawFrame(vk::Device device, vk::SwapchainKHR swapchain,
     if (++frameCounter >= 30) {
         frameCounter = 0;
         syncShaderInstances(device);
+        syncMeshInstances(device);
         updateGridBuffer(device);
     }
     static bool initialized = false;
     if (!initialized && registry) {
         syncShaderInstances(device);
+        syncMeshInstances(device);
         updateGridBuffer(device);
         initialized = true;
     }
@@ -1046,6 +1128,178 @@ void Renderer::destroyShaderInstance(vk::Device device, ShaderInstance& inst) {
     if (inst.initPipeline) { device.destroyPipeline(inst.initPipeline); inst.initPipeline = nullptr; }
     if (inst.computePipeline) { device.destroyPipeline(inst.computePipeline); inst.computePipeline = nullptr; }
     if (inst.graphicsPipeline) { device.destroyPipeline(inst.graphicsPipeline); inst.graphicsPipeline = nullptr; }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// MESH INSTANCE MANAGEMENT
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+vk::Pipeline Renderer::buildMeshGraphicsPipeline(vk::Device device,
+                                                 const std::string& vertPath,
+                                                 const std::string& fragPath,
+                                                 bool wireframe) {
+    auto vertSpirv = compileGLSL(vertPath);
+    auto fragSpirv = compileGLSL(fragPath);
+    if (vertSpirv.empty() || fragSpirv.empty()) {
+        Log::error("Failed to compile mesh shaders");
+        return nullptr;
+    }
+
+    vk::ShaderModule vertModule = device.createShaderModule(
+        vk::ShaderModuleCreateInfo({}, vertSpirv.size() * sizeof(uint32_t), vertSpirv.data()));
+    vk::ShaderModule fragModule = device.createShaderModule(
+        vk::ShaderModuleCreateInfo({}, fragSpirv.size() * sizeof(uint32_t), fragSpirv.data()));
+
+    vk::PipelineShaderStageCreateInfo shaderStages[] = {
+        { {}, vk::ShaderStageFlagBits::eVertex, vertModule, "main" },
+        { {}, vk::ShaderStageFlagBits::eFragment, fragModule, "main" }
+    };
+
+    // Mesh vertex input: position (vec3), normal (vec3), UV (vec2)
+    auto bindingDesc = MeshVertex::getBindingDescription();
+    auto attrDescs = MeshVertex::getAttributeDescriptions();
+    vk::PipelineVertexInputStateCreateInfo vertexInputInfo(
+        {}, 1, &bindingDesc,
+        static_cast<uint32_t>(attrDescs.size()), attrDescs.data());
+
+    vk::PipelineInputAssemblyStateCreateInfo inputAssembly(
+        {}, vk::PrimitiveTopology::eTriangleList, VK_FALSE);
+    vk::PipelineViewportStateCreateInfo viewportState({}, 1, nullptr, 1, nullptr);
+    vk::PipelineRasterizationStateCreateInfo rasterizer(
+        {}, VK_FALSE, VK_FALSE,
+        wireframe ? vk::PolygonMode::eLine : vk::PolygonMode::eFill,
+        vk::CullModeFlagBits::eBack, vk::FrontFace::eCounterClockwise,
+        VK_FALSE, 0, 0, 0, 1.0f);
+    vk::PipelineMultisampleStateCreateInfo multisampling(
+        {}, vk::SampleCountFlagBits::e1, VK_FALSE);
+    vk::PipelineDepthStencilStateCreateInfo depthStencil(
+        {}, VK_TRUE, VK_TRUE, vk::CompareOp::eLess, VK_FALSE, VK_FALSE);
+    vk::PipelineColorBlendAttachmentState colorBlendAttachment(VK_FALSE);
+    colorBlendAttachment.colorWriteMask =
+        vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    vk::PipelineColorBlendStateCreateInfo colorBlending(
+        {}, VK_FALSE, vk::LogicOp::eCopy, 1, &colorBlendAttachment);
+    std::vector<vk::DynamicState> dynamicStates = {
+        vk::DynamicState::eViewport, vk::DynamicState::eScissor };
+    vk::PipelineDynamicStateCreateInfo dynamicState(
+        {}, static_cast<uint32_t>(dynamicStates.size()), dynamicStates.data());
+
+    vk::GraphicsPipelineCreateInfo pipelineInfo(
+        {}, 2, shaderStages, &vertexInputInfo, &inputAssembly, nullptr,
+        &viewportState, &rasterizer, &multisampling, &depthStencil,
+        &colorBlending, &dynamicState, pipelineLayout, offscreenPass, 0);
+
+    auto result = device.createGraphicsPipeline(nullptr, pipelineInfo);
+    device.destroyShaderModule(vertModule);
+    device.destroyShaderModule(fragModule);
+    Log::ok("Compiled mesh: " + std::filesystem::path(vertPath).filename().string()
+            + " + " + std::filesystem::path(fragPath).filename().string());
+    return result.value;
+}
+
+void Renderer::destroyMeshInstance(vk::Device device, MeshShaderInstance& inst) {
+    if (inst.graphicsPipeline) { device.destroyPipeline(inst.graphicsPipeline); inst.graphicsPipeline = nullptr; }
+}
+
+void Renderer::syncMeshInstances(vk::Device device) {
+    if (!registry) return;
+    namespace fs = std::filesystem;
+
+    auto view = registry->view<MeshRendererComponent>();
+    for (auto entity : view) {
+        auto& mesh = view.get<MeshRendererComponent>(entity);
+        uint32_t key = static_cast<uint32_t>(entity);
+
+        // Load mesh if path is set but not yet cached
+        if (!mesh.meshPath.empty() && mesh.meshCacheKey.empty()) {
+            mesh.meshCacheKey = meshCache.load(mesh.meshPath, bufferManager);
+            if (mesh.meshCacheKey.empty()) mesh.meshPath.clear(); // Load failed
+        }
+
+        // Default to cube primitive if no mesh file specified
+        if (mesh.meshCacheKey.empty()) {
+            mesh.meshCacheKey = "__primitive_cube";
+        }
+
+        auto it = meshInstances.find(key);
+
+        // Hot-reload: check file modification times
+        if (it != meshInstances.end() && !mesh.shaderDirty) {
+            auto& inst = it->second;
+            auto checkMod = [](const std::string& path, fs::file_time_type& lastMod) -> bool {
+                if (path.empty() || !fs::exists(path)) return false;
+                auto mod = fs::last_write_time(path);
+                if (mod != lastMod) { lastMod = mod; return true; }
+                return false;
+            };
+            bool wireframeChanged = (inst.wireframe != mesh.wireframe);
+            if (wireframeChanged ||
+                checkMod(inst.vertexPath, inst.vertModTime) ||
+                checkMod(inst.fragmentPath, inst.fragModTime)) {
+                mesh.shaderDirty = true;
+                Log::info("Mesh shader change detected, recompiling...");
+            }
+        }
+
+        if (!mesh.shaderDirty) continue;
+
+        device.waitIdle();
+
+        if (it != meshInstances.end()) {
+            destroyMeshInstance(device, it->second);
+        }
+
+        MeshShaderInstance inst;
+        inst.owner = entity;
+        inst.wireframe = mesh.wireframe;
+
+        // Use engine defaults if user hasn't assigned custom shaders.
+        // Must use KMRB_SHADER_DIR (absolute) — relative paths break when cwd is build/.
+        std::string vertPath = mesh.vertexShaderPath.empty()
+            ? std::string(KMRB_SHADER_DIR) + "/engine/mesh_basic.vert"
+            : mesh.vertexShaderPath;
+        std::string fragPath = mesh.fragmentShaderPath.empty()
+            ? std::string(KMRB_SHADER_DIR) + "/engine/mesh_unlit.frag"
+            : mesh.fragmentShaderPath;
+
+        inst.vertexPath = vertPath;
+        inst.fragmentPath = fragPath;
+
+        if (fs::exists(vertPath) && fs::exists(fragPath)) {
+            // Reflect push constants from the fragment shader (more likely to have user params)
+            auto spirv = compileGLSL(fragPath);
+            if (!spirv.empty()) {
+                // Reuse the same reflection logic — MeshShaderInstance has the same fields
+                ShaderInstance tempReflect;
+                tempReflect.pushConstantSize = inst.pushConstantSize;
+                tempReflect.pushConstantData = inst.pushConstantData;
+                tempReflect.reflectedParams = inst.reflectedParams;
+                reflectPushConstants(spirv, tempReflect);
+                inst.pushConstantSize = tempReflect.pushConstantSize;
+                inst.pushConstantData = std::move(tempReflect.pushConstantData);
+                inst.reflectedParams = std::move(tempReflect.reflectedParams);
+            }
+
+            inst.graphicsPipeline = buildMeshGraphicsPipeline(device, vertPath, fragPath, mesh.wireframe);
+            inst.vertModTime = fs::last_write_time(vertPath);
+            inst.fragModTime = fs::last_write_time(fragPath);
+        }
+
+        meshInstances[key] = std::move(inst);
+        mesh.shaderDirty = false;
+    }
+
+    // Clean up orphaned instances
+    std::vector<uint32_t> toRemove;
+    for (auto& [key, inst] : meshInstances) {
+        if (!registry->valid(inst.owner)) {
+            device.waitIdle();
+            destroyMeshInstance(device, inst);
+            toRemove.push_back(key);
+        }
+    }
+    for (auto key : toRemove) meshInstances.erase(key);
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1644,6 +1898,9 @@ void Renderer::cleanup(vk::Device device) {
 
     for (auto& [key, inst] : shaderInstances) destroyShaderInstance(device, inst);
     shaderInstances.clear();
+    for (auto& [key, inst] : meshInstances) destroyMeshInstance(device, inst);
+    meshInstances.clear();
+    meshCache.cleanup(bufferManager);
     if (envCubemapView) device.destroyImageView(envCubemapView);
     if (envSampler) device.destroySampler(envSampler);
     if (envCubemap) device.destroyImage(envCubemap);

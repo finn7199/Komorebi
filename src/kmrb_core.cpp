@@ -80,6 +80,8 @@ void Core::init() {
         // Mark all shader instances dirty so they recompile next sync
         auto view = registry.view<ShaderProgramComponent>();
         for (auto e : view) view.get<ShaderProgramComponent>(e).dirty = true;
+        auto meshView = registry.view<MeshRendererComponent>();
+        for (auto e : meshView) meshView.get<MeshRendererComponent>(e).shaderDirty = true;
         kmrb::Log::info("Force recompiling all shaders...");
     });
     renderer.getUI().setOnEnvMapLoad([this](const std::string& path) {
@@ -92,6 +94,7 @@ void Core::init() {
     renderer.getUI().setRegistry(&registry);
     renderer.getUI().setBufferManager(&renderer.getBufferManager());
     renderer.getUI().setShaderInstances(renderer.getShaderInstancesPtr());
+    renderer.getUI().setMeshInstances(renderer.getMeshInstancesPtr());
     renderer.setRegistry(&registry);
 }
 

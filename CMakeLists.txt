@@ -9,6 +9,7 @@ find_package(glfw3 CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(EnTT CONFIG REQUIRED)
 find_package(Stb REQUIRED)
+find_package(assimp CONFIG REQUIRED)
 
 # Vulkan SDK ships shaderc and SPIRV tools — point CMake to them
 set(VULKAN_SDK_PATH "$ENV{VULKAN_SDK}")
@@ -43,6 +44,8 @@ add_executable(Komorebi
     src/kmrb_camera.hpp
     src/kmrb_types.hpp
     src/stb_image_impl.cpp
+    src/kmrb_mesh.cpp
+    src/kmrb_mesh.hpp
 )
 
 # Link the libraries to our executable
@@ -52,6 +55,7 @@ target_link_libraries(Komorebi PRIVATE
     glm::glm
     imgui
     EnTT::EnTT
+    assimp::assimp
 )
 
 # Pass source paths to code so shaders can be found regardless of working directory

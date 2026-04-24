@@ -16,6 +16,14 @@ cmake-build-*/
 
 # Claude Code
 .claude/
+CLAUDE.md
+
+# Graphify
+graphify-out/
+.graphify_python
+.graphify_*.json
+.graphify_*.txt
+.tmp_*.py
 
 # Test assets (HDR environment maps, 3D models, textures)
 *.hdr
