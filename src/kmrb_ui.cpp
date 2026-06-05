@@ -560,6 +560,48 @@ void UI::drawMenuBar() {
             ImGui::EndMenu();
         }
 
+        // ── RENDER ──
+        if (ImGui::BeginMenu("Render")) {
+            if (ImGui::MenuItem("Reload Mesh Shaders")) {
+                if (registry) {
+                    int count = 0;
+                    auto view = registry->view<MeshRendererComponent>();
+                    for (auto e : view) {
+                        view.get<MeshRendererComponent>(e).shaderDirty = true;
+                        count++;
+                    }
+                    if (count > 0) Log::info("Reloading mesh shaders (" + std::to_string(count) + " mesh(es))...");
+                    else           Log::warn("No mesh entities in scene");
+                }
+            }
+
+            if (ImGui::MenuItem("Toggle Wireframe (All)")) {
+                if (registry) {
+                    auto view = registry->view<MeshRendererComponent>();
+                    // If any mesh is solid, switch all to wireframe; otherwise switch all off
+                    bool anyOff = false;
+                    for (auto e : view) anyOff |= !view.get<MeshRendererComponent>(e).wireframe;
+                    int count = 0;
+                    for (auto e : view) {
+                        auto& m = view.get<MeshRendererComponent>(e);
+                        m.wireframe = anyOff;
+                        m.shaderDirty = true;
+                        count++;
+                    }
+                    if (count > 0) Log::info(std::string("Wireframe ") + (anyOff ? "on" : "off") + " (all meshes)");
+                    else           Log::warn("No mesh entities in scene");
+                }
+            }
+
+            ImGui::Separator();
+
+            if (ImGui::MenuItem("Clear Mesh Cache")) {
+                if (onClearMeshCache) onClearMeshCache();
+            }
+
+            ImGui::EndMenu();
+        }
+
         // ── VIEW ──
         if (ImGui::BeginMenu("View")) {
             ImGui::MenuItem("ImGui Demo", nullptr, &showDemoWindow);
@@ -1047,6 +1089,24 @@ void UI::drawAddEntityMenu() {
 
 void UI::drawViewport(vk::DescriptorSet viewportTexture, vk::Extent2D viewportExtent,
                       uint32_t particleCount, float fps, float computeTime) {
+    // Mesh stats for status bar — O(n meshes), trivially cheap
+    uint32_t meshCount = 0, meshTotalVerts = 0;
+    if (registry) {
+        auto mv = registry->view<MeshRendererComponent>();
+        for (auto e : mv) {
+            meshCount++;
+            meshTotalVerts += mv.get<MeshRendererComponent>(e).vertexCount;
+        }
+    }
+
+    // Compact vertex count formatter: 48288 → "48.3K", 1200000 → "1.2M"
+    auto fmtVerts = [](uint32_t v) -> std::string {
+        char buf[16];
+        if (v >= 1000000) { snprintf(buf, sizeof(buf), "%.1fM", v / 1000000.0f); return buf; }
+        if (v >= 1000)    { snprintf(buf, sizeof(buf), "%.1fK", v / 1000.0f);    return buf; }
+        return std::to_string(v);
+    };
+
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     if (ImGui::Begin("Viewport")) {
         viewportHovered = ImGui::IsWindowHovered();
@@ -1079,6 +1139,16 @@ void UI::drawViewport(vk::DescriptorSet viewportTexture, vk::Extent2D viewportEx
         ImGui::TextColored(hex(0x8B7D6B), "Particles");
         ImGui::SameLine();
         ImGui::TextColored(hex(0xE8DCC8), "%u", particleCount);
+        ImGui::SameLine(0, 20);
+
+        // Mesh count + aggregate vertex total
+        ImGui::TextColored(hex(0x8B7D6B), "Meshes");
+        ImGui::SameLine();
+        ImGui::TextColored(hex(0xE8DCC8), "%u", meshCount);
+        if (meshTotalVerts > 0) {
+            ImGui::SameLine(0, 4);
+            ImGui::TextColored(hex(0x5C5347), "(%sv)", fmtVerts(meshTotalVerts).c_str());
+        }
         ImGui::SameLine(0, 20);
 
         // Resolution: viewport panel size | render framebuffer size
@@ -1413,6 +1483,49 @@ void UI::drawInspector(uint32_t particleCount,
                     }
                 }
 
+                // ── Geometry stats ──
+                if (ImGui::CollapsingHeader("Geometry", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    if (meshComp->vertexCount == 0) {
+                        ImGui::TextColored(hex(0x5C5347), "  Loading...");
+                    } else {
+                        auto fmtBytes = [](uint32_t b) -> std::string {
+                            if (b >= 1024 * 1024)
+                                return std::to_string(b / (1024 * 1024)) + "." +
+                                       std::to_string((b % (1024 * 1024)) * 10 / (1024 * 1024)) + " MB";
+                            if (b >= 1024)
+                                return std::to_string(b / 1024) + "." +
+                                       std::to_string((b % 1024) * 10 / 1024) + " KB";
+                            return std::to_string(b) + " B";
+                        };
+
+                        ImGui::TextColored(hex(0x8B7D6B), "  Vertices");
+                        ImGui::SameLine(110);
+                        ImGui::TextColored(hex(0xE8DCC8), "%u", meshComp->vertexCount);
+
+                        ImGui::TextColored(hex(0x8B7D6B), "  Triangles");
+                        ImGui::SameLine(110);
+                        ImGui::TextColored(hex(0xE8DCC8), "%u", meshComp->indexCount / 3);
+
+                        ImGui::TextColored(hex(0x8B7D6B), "  GPU Mem");
+                        ImGui::SameLine(110);
+                        ImGui::TextColored(hex(0xE8DCC8), "%s",
+                            meshComp->gpuBytes > 0 ? fmtBytes(meshComp->gpuBytes).c_str() : "—");
+
+                        ImGui::TextColored(hex(0x8B7D6B), "  Status");
+                        ImGui::SameLine(110);
+                        if (meshInstancesPtr) {
+                            auto* insts = static_cast<std::unordered_map<uint32_t,
+                                              Renderer::MeshShaderInstance>*>(meshInstancesPtr);
+                            uint32_t ek = static_cast<uint32_t>(selectedEntity);
+                            bool ready = insts->count(ek) && (*insts).at(ek).graphicsPipeline;
+                            if (ready) ImGui::TextColored(hex(0x7BA56E), "Ready");
+                            else       ImGui::TextColored(hex(0xC8A44E), "Building");
+                        } else {
+                            ImGui::TextColored(hex(0x5C5347), "—");
+                        }
+                    }
+                }
+
                 // Shader slots (Vertex + Fragment) — same drag-drop pattern as Pipeline
                 auto drawMeshShaderSlot = [&](const char* label, std::string& path, const char* ext) {
                     std::string filename = path.empty() ? "(default)" : fs::path(path).filename().string();
@@ -1643,6 +1756,119 @@ void UI::drawDataOutput() {
                 ImGui::EndTabItem();
             }
 
+            // ── Mesh Stats tab ──
+            if (ImGui::BeginTabItem("Mesh")) {
+                auto formatMeshSize = [](uint32_t bytes) -> std::string {
+                    if (bytes >= 1024 * 1024)
+                        return std::to_string(bytes / (1024 * 1024)) + "." +
+                               std::to_string((bytes % (1024 * 1024)) * 10 / (1024 * 1024)) + " MB";
+                    if (bytes >= 1024)
+                        return std::to_string(bytes / 1024) + "." +
+                               std::to_string((bytes % 1024) * 10 / 1024) + " KB";
+                    return std::to_string(bytes) + " B";
+                };
+
+                if (!registry) {
+                    ImGui::TextColored(hex(0x5C5347), "No scene loaded");
+                } else {
+                    auto meshView = registry->view<MeshRendererComponent, Name>();
+
+                    // Aggregate totals
+                    uint32_t totalVerts = 0, totalTris = 0, totalBytes = 0;
+                    int meshCount = 0;
+                    for (auto entity : meshView) {
+                        auto& m = meshView.get<MeshRendererComponent>(entity);
+                        totalVerts += m.vertexCount;
+                        totalTris  += m.indexCount / 3;
+                        totalBytes += m.gpuBytes;
+                        meshCount++;
+                    }
+
+                    // Summary line
+                    ImGui::TextColored(hex(0x8B7D6B), "Total");
+                    ImGui::SameLine(60);
+                    ImGui::TextColored(hex(0xE8DCC8), "%d mesh%s", meshCount, meshCount == 1 ? "" : "es");
+                    ImGui::SameLine(0, 20);
+                    ImGui::TextColored(hex(0x8B7D6B), "Verts");
+                    ImGui::SameLine();
+                    ImGui::TextColored(hex(0xE8DCC8), "%u", totalVerts);
+                    ImGui::SameLine(0, 20);
+                    ImGui::TextColored(hex(0x8B7D6B), "Tris");
+                    ImGui::SameLine();
+                    ImGui::TextColored(hex(0xE8DCC8), "%u", totalTris);
+                    ImGui::SameLine(0, 20);
+                    ImGui::TextColored(hex(0x8B7D6B), "GPU");
+                    ImGui::SameLine();
+                    ImGui::TextColored(hex(0xE8DCC8), "%s", formatMeshSize(totalBytes).c_str());
+
+                    ImGui::Separator();
+
+                    if (meshCount == 0) {
+                        ImGui::TextColored(hex(0x5C5347), "No mesh entities — add a Mesh in the Scene Hierarchy");
+                    } else {
+                        ImGuiTableFlags tableFlags = ImGuiTableFlags_ScrollY
+                                                   | ImGuiTableFlags_RowBg
+                                                   | ImGuiTableFlags_BordersOuter
+                                                   | ImGuiTableFlags_BordersV
+                                                   | ImGuiTableFlags_Resizable;
+
+                        if (ImGui::BeginTable("mesh_stats_table", 6, tableFlags)) {
+                            ImGui::TableSetupScrollFreeze(0, 1);
+                            ImGui::TableSetupColumn("Name",    ImGuiTableColumnFlags_WidthStretch);
+                            ImGui::TableSetupColumn("File",    ImGuiTableColumnFlags_WidthStretch);
+                            ImGui::TableSetupColumn("Verts",   ImGuiTableColumnFlags_WidthFixed, 65.0f);
+                            ImGui::TableSetupColumn("Tris",    ImGuiTableColumnFlags_WidthFixed, 65.0f);
+                            ImGui::TableSetupColumn("GPU Mem", ImGuiTableColumnFlags_WidthFixed, 72.0f);
+                            ImGui::TableSetupColumn("Status",  ImGuiTableColumnFlags_WidthFixed, 62.0f);
+                            ImGui::TableHeadersRow();
+
+                            auto* meshInsts = meshInstancesPtr
+                                ? static_cast<std::unordered_map<uint32_t, Renderer::MeshShaderInstance>*>(meshInstancesPtr)
+                                : nullptr;
+
+                            for (auto entity : meshView) {
+                                auto& m  = meshView.get<MeshRendererComponent>(entity);
+                                auto* nm = registry->try_get<Name>(entity);
+
+                                ImGui::TableNextRow();
+
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::TextColored(hex(0xE8DCC8), "%s", nm ? nm->value.c_str() : "Mesh");
+
+                                ImGui::TableSetColumnIndex(1);
+                                if (m.meshPath.empty()) {
+                                    ImGui::TextColored(hex(0x5C5347), "(cube primitive)");
+                                } else {
+                                    std::string fname = std::filesystem::path(m.meshPath).filename().string();
+                                    ImGui::TextColored(hex(0xB8A47C), "%s", fname.c_str());
+                                }
+
+                                ImGui::TableSetColumnIndex(2);
+                                if (m.vertexCount > 0) ImGui::Text("%u", m.vertexCount);
+                                else ImGui::TextColored(hex(0x5C5347), "—");
+
+                                ImGui::TableSetColumnIndex(3);
+                                if (m.indexCount > 0) ImGui::Text("%u", m.indexCount / 3);
+                                else ImGui::TextColored(hex(0x5C5347), "—");
+
+                                ImGui::TableSetColumnIndex(4);
+                                if (m.gpuBytes > 0) ImGui::Text("%s", formatMeshSize(m.gpuBytes).c_str());
+                                else ImGui::TextColored(hex(0x5C5347), "—");
+
+                                ImGui::TableSetColumnIndex(5);
+                                uint32_t ek = static_cast<uint32_t>(entity);
+                                bool ready = meshInsts && meshInsts->count(ek) &&
+                                             (*meshInsts).at(ek).graphicsPipeline;
+                                if (ready) ImGui::TextColored(hex(0x7BA56E), "Ready");
+                                else       ImGui::TextColored(hex(0xC8A44E), "Building");
+                            }
+                            ImGui::EndTable();
+                        }
+                    }
+                }
+                ImGui::EndTabItem();
+            }
+
             // ── Export tab ──
             if (ImGui::BeginTabItem("Export")) {
                 ImGui::Spacing();
@@ -1726,9 +1952,12 @@ void UI::drawPreferences() {
             renderWidth = std::clamp(renderWidth, 320, 7680);
             renderHeight = std::clamp(renderHeight, 240, 4320);
             ImGui::TextColored(hex(0x5C5347), "  Offscreen framebuffer size. Affects GPU load.");
+        }
 
-            ImGui::Spacing();
+        ImGui::Spacing();
 
+        // ── Particle Simulation ──
+        if (ImGui::CollapsingHeader("Particle Simulation", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::TextColored(hex(0x8B7D6B), "Particle Count");
             ImGui::SameLine(160);
             ImGui::SetNextItemWidth(-1);
@@ -1737,6 +1966,19 @@ void UI::drawPreferences() {
             particleCount = std::clamp(particleCount, 100, 1000000);
             if (particleCount != prev) particleCountDirty = true;
             ImGui::TextColored(hex(0x5C5347), "  Max particles in the SSBO. Init shader fills up to this count.");
+        }
+
+        ImGui::Spacing();
+
+        // ── Mesh Rendering ──
+        if (ImGui::CollapsingHeader("Mesh Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextColored(hex(0x8B7D6B), "Default Shader");
+            ImGui::SameLine(160);
+            ImGui::TextColored(hex(0x5C5347), "Unlit (engine default)");
+
+            ImGui::Spacing();
+            ImGui::TextColored(hex(0x5C5347), "  Per-mesh shader overrides in Inspector > Shaders.");
+            ImGui::TextColored(hex(0x5C5347), "  PBR / shadow settings coming in V2.");
         }
 
         ImGui::Spacing();

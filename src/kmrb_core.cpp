@@ -90,6 +90,9 @@ void Core::init() {
     renderer.getUI().setOnEnvMapClear([this]() {
         renderer.clearEnvMap(device);
     });
+    renderer.getUI().setOnClearMeshCache([this]() {
+        renderer.clearMeshCache(device);
+    });
     renderer.getUI().setWindow(window);
     renderer.getUI().setRegistry(&registry);
     renderer.getUI().setBufferManager(&renderer.getBufferManager());

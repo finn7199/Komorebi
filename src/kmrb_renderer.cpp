@@ -541,25 +541,18 @@ void Renderer::updateGlobalUBO(uint32_t imageIndex) {
     // Gather lights from ECS into the UBO array so user shaders can read them
     ubo.lightCount = 0;
     if (registry) {
-        auto lightView = registry->view<LightComponent, Transform>();
-        for (auto entity : lightView) {
-            if (ubo.lightCount >= static_cast<int>(MAX_LIGHTS)) break;
-            auto& lc = lightView.get<LightComponent>(entity);
-            auto& lt = lightView.get<Transform>(entity);
-
+        registry->view<LightComponent, Transform>().each([&](auto, auto& lc, auto& lt) {
+            if (ubo.lightCount >= static_cast<int>(MAX_LIGHTS)) return;
             GPULight& gpu = ubo.lights[ubo.lightCount];
             gpu.positionAndType = glm::vec4(lt.position, static_cast<float>(lc.type));
-
-            // Direction from rotation: forward = -Z in local space, rotated by Euler angles
             float pitch = glm::radians(lt.rotation.x);
             float yaw   = glm::radians(lt.rotation.y);
             glm::vec3 dir(cos(pitch) * sin(yaw), -sin(pitch), -cos(pitch) * cos(yaw));
             gpu.directionAndAngle = glm::vec4(glm::normalize(dir), cos(glm::radians(lc.spotAngle)));
-
             gpu.colorAndIntensity = glm::vec4(lc.color, lc.intensity);
             gpu.params = glm::vec4(lc.radius, 0, 0, 0);
             ubo.lightCount++;
-        }
+        });
     }
 
     std::string name = "global_ubo_" + std::to_string(imageIndex);
@@ -576,15 +569,11 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
     // Find the active pipeline's shader instance
     ShaderInstance* activeInstance = nullptr;
     if (registry) {
-        auto view = registry->view<PipelineComponent, ShaderProgramComponent>();
-        for (auto entity : view) {
-            uint32_t key = static_cast<uint32_t>(entity);
-            auto it = shaderInstances.find(key);
-            if (it != shaderInstances.end()) {
-                activeInstance = &it->second;
-                break;
-            }
-        }
+        registry->view<PipelineComponent, ShaderProgramComponent>().each([&](auto entity, auto&, auto&) {
+            if (activeInstance) return;
+            auto it = shaderInstances.find(static_cast<uint32_t>(entity));
+            if (it != shaderInstances.end()) activeInstance = &it->second;
+        });
     }
 
     // ── INIT SHADER (one-shot: runs once to set up initial particle positions) ──
@@ -726,15 +715,11 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
 
     // ── MESH ENTITIES ──
     if (registry) {
-        auto meshView = registry->view<MeshRendererComponent, Transform>();
-        for (auto entity : meshView) {
-            auto& meshComp = meshView.get<MeshRendererComponent>(entity);
-            auto& meshTransform = meshView.get<Transform>(entity);
-
+        registry->view<MeshRendererComponent, Transform>().each([&](auto entity, auto& meshComp, auto& meshTransform) {
             uint32_t key = static_cast<uint32_t>(entity);
             auto instIt = meshInstances.find(key);
-            if (instIt == meshInstances.end() || !instIt->second.graphicsPipeline) continue;
-            if (!meshCache.exists(meshComp.meshCacheKey)) continue;
+            if (instIt == meshInstances.end() || !instIt->second.graphicsPipeline) return;
+            if (!meshCache.exists(meshComp.meshCacheKey)) return;
 
             const auto& gpuMesh = meshCache.get(meshComp.meshCacheKey);
             auto& inst = instIt->second;
@@ -747,7 +732,6 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
                     DESCRIPTOR_SET_MATERIAL, envDescriptorSet, nullptr);
             }
 
-            // Build model matrix from Transform
             glm::mat4 model = glm::translate(glm::mat4(1.0f), meshTransform.position);
             model = glm::rotate(model, glm::radians(meshTransform.rotation.y), glm::vec3(0, 1, 0));
             model = glm::rotate(model, glm::radians(meshTransform.rotation.x), glm::vec3(1, 0, 0));
@@ -774,7 +758,7 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
             cmd.bindVertexBuffers(0, vb, offset);
             cmd.bindIndexBuffer(bufferManager.getBuffer(gpuMesh.indexBufferName), 0, vk::IndexType::eUint32);
             cmd.drawIndexed(gpuMesh.indexCount, 1, 0, 0, 0);
-        }
+        });
     }
 
     // ── GRID LINES ──
@@ -787,24 +771,21 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
             DESCRIPTOR_SET_GLOBAL, globalDescriptorSets[imageIndex], nullptr);
 
         // Get grid entity position and color for push constants
-        auto gridView = registry->view<GridComponent, Transform>();
-        for (auto entity : gridView) {
-            auto& gridTransform = gridView.get<Transform>(entity);
-            auto& gridProps = gridView.get<GridComponent>(entity);
-
+        bool gridRendered = false;
+        registry->view<GridComponent, Transform>().each([&](auto, auto& gridProps, auto& gridTransform) {
+            if (gridRendered) return;
             PushConstants gridPush{};
             gridPush.model = glm::translate(glm::mat4(1.0f), gridTransform.position);
             gridPush.color = gridProps.color;
             cmd.pushConstants(pipelineLayout,
                 vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eCompute,
                 0, sizeof(PushConstants), &gridPush);
-
             vk::Buffer gridBuf = bufferManager.getBuffer("grid_lines");
             vk::DeviceSize offset = 0;
             cmd.bindVertexBuffers(0, gridBuf, offset);
             cmd.draw(gridVertexCount, 1, 0, 0);
-            break; // Only render first grid for now
-        }
+            gridRendered = true;
+        });
     }
 
     cmd.endRenderPass();
@@ -899,13 +880,9 @@ bool Renderer::drawFrame(vk::Device device, vk::SwapchainKHR swapchain,
     camera.update(window, 0.016f); // Fixed dt for input (actual physics dt is in UBO)
 
     if (registry) {
-        auto camView = registry->view<CameraComponent, Transform>();
-        for (auto entity : camView) {
-            auto& cam = camView.get<CameraComponent>(entity);
-            if (!cam.active) continue;
-
-            auto& t = camView.get<Transform>(entity);
-
+        bool camFound = false;
+        registry->view<CameraComponent, Transform>().each([&](auto, auto& cam, auto& t) {
+            if (camFound || !cam.active) return;
             if (camera.isUserControlling) {
                 t.position = camera.position;
                 t.rotation = glm::vec3(camera.pitch, camera.yaw, camera.roll);
@@ -915,8 +892,8 @@ bool Renderer::drawFrame(vk::Device device, vk::SwapchainKHR swapchain,
                 camera.yaw = t.rotation.y;
                 camera.roll = t.rotation.z;
             }
-            break;
-        }
+            camFound = true;
+        });
     }
 
 
@@ -1222,6 +1199,19 @@ void Renderer::syncMeshInstances(vk::Device device) {
             mesh.meshCacheKey = "__primitive_cube";
         }
 
+        // Sync GPU stats to component so the UI Data Output panel can display them
+        if (meshCache.exists(mesh.meshCacheKey)) {
+            const auto& gpu = meshCache.get(mesh.meshCacheKey);
+            mesh.vertexCount = gpu.vertexCount;
+            mesh.indexCount  = gpu.indexCount;
+            vk::DeviceSize bytes = 0;
+            if (bufferManager.exists(gpu.vertexBufferName))
+                bytes += bufferManager.getInfo(gpu.vertexBufferName).size;
+            if (bufferManager.exists(gpu.indexBufferName))
+                bytes += bufferManager.getInfo(gpu.indexBufferName).size;
+            mesh.gpuBytes = static_cast<uint32_t>(bytes);
+        }
+
         auto it = meshInstances.find(key);
 
         // Hot-reload: check file modification times
@@ -1300,6 +1290,35 @@ void Renderer::syncMeshInstances(vk::Device device) {
         }
     }
     for (auto key : toRemove) meshInstances.erase(key);
+}
+
+void Renderer::clearMeshCache(vk::Device device) {
+    device.waitIdle();
+
+    // Destroy all mesh shader instance pipelines
+    for (auto& [key, inst] : meshInstances) destroyMeshInstance(device, inst);
+    meshInstances.clear();
+
+    // Destroy GPU vertex/index buffers and clear the cache map
+    meshCache.cleanup(bufferManager);
+
+    // Re-upload built-in primitives so the default cube fallback still works
+    meshCache.loadPrimitives(bufferManager);
+
+    // Reset all MeshRendererComponent state so syncMeshInstances reloads everything
+    if (registry) {
+        auto view = registry->view<MeshRendererComponent>();
+        for (auto e : view) {
+            auto& m = view.get<MeshRendererComponent>(e);
+            m.meshCacheKey.clear();
+            m.vertexCount = 0;
+            m.indexCount  = 0;
+            m.gpuBytes    = 0;
+            m.shaderDirty = true;
+        }
+    }
+
+    Log::info("Mesh cache cleared — meshes will reload on next sync");
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1506,6 +1525,7 @@ std::vector<uint32_t> Renderer::compileGLSL(const std::string& sourcePath) {
     // -g preserves variable names (OpName) in SPIR-V so SPIRV-Reflect can read them.
     // Without it, -O strips names and reflected params show as "unnamed".
     std::string cmd = "glslc --target-env=vulkan1.3 -O -g";
+    cmd += " -I \"" + std::string(KMRB_SHADER_DIR) + "/include\"";
     cmd += " \"" + sourcePath + "\" -o \"" + outputPath + "\" 2>&1";
 
     FILE* pipe = _popen(cmd.c_str(), "r");

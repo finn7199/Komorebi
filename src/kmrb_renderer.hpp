@@ -47,6 +47,9 @@ public:
     void loadEnvMap(vk::Device device, const std::string& path) { loadEnvironmentMap(device, path); }
     void clearEnvMap(vk::Device device) { destroyEnvironmentMap(device); }
 
+    // Destroy all mesh GPU buffers and force a full reload on next sync
+    void clearMeshCache(vk::Device device);
+
     // Re-run init shaders on next frame (called after simulation reset)
     void requestInitDispatch() {
         for (auto& [key, inst] : shaderInstances) {

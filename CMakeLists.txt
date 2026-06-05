@@ -91,7 +91,7 @@ foreach(SHADER ${SHADERS})
     set(SPIRV_OUTPUT "${SHADER_OUT_DIR}/${SHADER_NAME}.spv")
     add_custom_command(
         OUTPUT ${SPIRV_OUTPUT}
-        COMMAND ${GLSLC} ${SHADER} -o ${SPIRV_OUTPUT}
+        COMMAND ${GLSLC} -I "${SHADER_DIR}/include" ${SHADER} -o ${SPIRV_OUTPUT}
         DEPENDS ${SHADER}
         COMMENT "Compiling shader: ${SHADER_NAME}"
     )

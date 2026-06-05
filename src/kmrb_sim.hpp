@@ -69,6 +69,11 @@ struct MeshRendererComponent {
     bool wireframe = false;
     bool shaderDirty = true;            // Set by UI/hot-reload, cleared after pipeline rebuild
     std::string meshCacheKey;           // Runtime: key into MeshCache (not serialized)
+
+    // Runtime stats — written by renderer after GPU upload, read by UI (not serialized)
+    uint32_t vertexCount = 0;
+    uint32_t indexCount  = 0;
+    uint32_t gpuBytes    = 0;
 };
 
 // Light — stub for V2 lighting

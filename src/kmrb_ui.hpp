@@ -73,6 +73,7 @@ public:
     void setOnEnvMapLoad(std::function<void(const std::string&)> cb) { onEnvMapLoad = std::move(cb); }
     void setOnEnvMapClear(std::function<void()> cb) { onEnvMapClear = std::move(cb); }
     void setOnReloadShaders(std::function<void()> cb) { onReloadShaders = std::move(cb); }
+    void setOnClearMeshCache(std::function<void()> cb) { onClearMeshCache = std::move(cb); }
 
     // Simulation state — read by renderer to gate compute dispatch
     bool shouldDispatchCompute() {
@@ -118,6 +119,7 @@ private:
     std::function<void(const std::string&)> onEnvMapLoad;
     std::function<void()> onEnvMapClear;
     std::function<void()> onReloadShaders;
+    std::function<void()> onClearMeshCache;
     GLFWwindow* glfwWindow = nullptr;
 
     // Simulation playback state
