@@ -22,7 +22,7 @@ Komorebi is a real-time 3D rendering and particle simulation editor built from s
 **Real-time controls & 3D model loading**
 Shader parameters appear automatically as UI sliders. Load any `.fbx`, `.obj`, or `.gltf` model, assign custom shaders, and tweak everything live.
 
-<video src="media/model%20load%20and%20light.mp4" autoplay loop muted playsinline width="860"></video>
+<video src="https://github.com/user-attachments/assets/f5df823d-9ad9-4401-9a95-c101aebb0b96" autoplay loop muted playsinline width="860"></video>
 <br/><em>Slider control and 3D model loading</em>
 
 ---
@@ -30,7 +30,7 @@ Shader parameters appear automatically as UI sliders. Load any `.fbx`, `.obj`, o
 **Live shader hot-reload & auto-generated UI**
 Edit a shader file and save — the engine recompiles instantly. Add a variable in GLSL and a slider appears in the Inspector automatically, no manual UI wiring needed.
 
-<video src="media/hot%20reload.mp4" autoplay loop muted playsinline width="860"></video>
+<video src="https://github.com/user-attachments/assets/e9950cb9-a983-4ddc-a39a-85a4439a45b9" autoplay loop muted playsinline width="860"></video>
 <br/><em>Hot reload and auto-generated Inspector controls</em>
 
 ---
