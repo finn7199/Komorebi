@@ -290,6 +290,135 @@ void Renderer::updateGridBuffer(vk::Device device) {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LIGHT GIZMOS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+void Renderer::appendCross(std::vector<glm::vec3>& out, const glm::vec3& c, float s) {
+    out.push_back(c + glm::vec3(-s, 0, 0)); out.push_back(c + glm::vec3(s, 0, 0));
+    out.push_back(c + glm::vec3(0, -s, 0)); out.push_back(c + glm::vec3(0, s, 0));
+    out.push_back(c + glm::vec3(0, 0, -s)); out.push_back(c + glm::vec3(0, 0, s));
+}
+
+void Renderer::appendSphereRings(std::vector<glm::vec3>& out, const glm::vec3& c, float r, int seg) {
+    const float TAU = 6.28318530718f;
+    for (int i = 0; i < seg; ++i) {
+        float a0 = TAU * i / seg, a1 = TAU * (i + 1) / seg;
+        float c0 = cosf(a0), s0 = sinf(a0), c1 = cosf(a1), s1 = sinf(a1);
+        out.push_back(c + glm::vec3(r*c0, r*s0, 0)); out.push_back(c + glm::vec3(r*c1, r*s1, 0));
+        out.push_back(c + glm::vec3(r*c0, 0, r*s0)); out.push_back(c + glm::vec3(r*c1, 0, r*s1));
+        out.push_back(c + glm::vec3(0, r*c0, r*s0)); out.push_back(c + glm::vec3(0, r*c1, r*s1));
+    }
+}
+
+void Renderer::appendSpotCone(std::vector<glm::vec3>& out, const glm::vec3& apex,
+                              const glm::vec3& dir, float angleDeg, float range, int seg) {
+    const float TAU = 6.28318530718f;
+    glm::vec3 d = glm::normalize(dir);
+    glm::vec3 up  = (fabsf(d.y) > 0.99f) ? glm::vec3(1, 0, 0) : glm::vec3(0, 1, 0);
+    glm::vec3 rgt = glm::normalize(glm::cross(d, up));
+    glm::vec3 u   = glm::cross(rgt, d);
+
+    float ringR  = range * tanf(glm::radians(angleDeg));
+    glm::vec3 center = apex + d * range;
+
+    // Center aim line
+    out.push_back(apex); out.push_back(center);
+
+    glm::vec3 prev{};
+    for (int i = 0; i <= seg; ++i) {
+        float a = TAU * i / seg;
+        glm::vec3 p = center + (rgt * cosf(a) + u * sinf(a)) * ringR;
+        if (i > 0) { out.push_back(prev); out.push_back(p); }
+        prev = p;
+        if (i > 0 && i % (seg / 4) == 0) { out.push_back(apex); out.push_back(p); }
+    }
+}
+
+void Renderer::appendDirArrows(std::vector<glm::vec3>& out, const glm::vec3& origin,
+                               const glm::vec3& dir, float len) {
+    glm::vec3 d = glm::normalize(dir);
+    glm::vec3 up  = (fabsf(d.y) > 0.99f) ? glm::vec3(1, 0, 0) : glm::vec3(0, 1, 0);
+    glm::vec3 rgt = glm::normalize(glm::cross(d, up));
+    const float head = 0.25f;
+    glm::vec3 a = origin, b = origin + d * len;
+    out.push_back(a); out.push_back(b);
+    out.push_back(b); out.push_back(b - d*head + rgt*head*0.5f);
+    out.push_back(b); out.push_back(b - d*head - rgt*head*0.5f);
+}
+
+void Renderer::updateGizmoBuffer(vk::Device device) {
+    gizmoDraws.clear();
+    if (!registry) return;
+
+    std::vector<glm::vec3> verts;
+    entt::entity sel = ui.getSelectedEntity();
+
+    registry->view<LightComponent, Transform>().each([&](auto entity, auto& lc, auto& lt) {
+        uint32_t first = static_cast<uint32_t>(verts.size());
+
+        float pitch = glm::radians(lt.rotation.x);
+        float yaw   = glm::radians(lt.rotation.y);
+        glm::vec3 dir(cosf(pitch) * sinf(yaw), -sinf(pitch), -cosf(pitch) * cosf(yaw));
+
+        if (lc.type == LightType::Point) {
+            appendSphereRings(verts, lt.position, 0.3f, 24);
+            appendCross(verts, lt.position, 0.15f);
+        } else if (lc.type == LightType::Spot) {
+            appendSpotCone(verts, lt.position, dir, lc.spotAngle, 2.0f, 24);
+            appendCross(verts, lt.position, 0.15f);
+        } else {
+            // Directional — anchor near camera so it's always visible
+            glm::vec3 anchor = camera.position + camera.getForward() * 4.0f;
+            appendDirArrows(verts, anchor, dir, 1.5f);
+            appendCross(verts, anchor, 0.15f);
+        }
+
+        GizmoDrawCmd dc;
+        dc.firstVertex = first;
+        dc.vertexCount = static_cast<uint32_t>(verts.size()) - first;
+        dc.color = glm::vec4(lc.color, 1.0f);
+        dc.selected = (entity == sel);
+        gizmoDraws.push_back(dc);
+    });
+
+    if (verts.empty()) return;
+
+    constexpr vk::DeviceSize maxBuf = sizeof(glm::vec3) * 8 * 400;
+    if (!bufferManager.exists("light_gizmos")) {
+        bufferManager.createBuffer("light_gizmos", maxBuf,
+            vk::BufferUsageFlagBits::eVertexBuffer,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    }
+    bufferManager.upload("light_gizmos", verts.data(), sizeof(glm::vec3) * verts.size());
+}
+
+void Renderer::drawLightGizmos(vk::CommandBuffer cmd, uint32_t imageIndex) {
+    if (!ui.getShowGizmos() || gizmoDraws.empty() || !bufferManager.exists("light_gizmos"))
+        return;
+
+    cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, gridPipeline);
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout,
+        DESCRIPTOR_SET_GLOBAL, globalDescriptorSets[imageIndex], nullptr);
+
+    vk::Buffer buf = bufferManager.getBuffer("light_gizmos");
+    vk::DeviceSize offset = 0;
+    cmd.bindVertexBuffers(0, buf, offset);
+
+    for (const auto& dc : gizmoDraws) {
+        PushConstants push{};
+        push.model = glm::mat4(1.0f);
+        // Selected light uses the editor's golden accent color
+        push.color = dc.selected
+            ? glm::vec4(0.78f, 0.64f, 0.30f, 1.0f)
+            : dc.color;
+        cmd.pushConstants(pipelineLayout,
+            vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eCompute,
+            0, sizeof(PushConstants), &push);
+        cmd.draw(dc.vertexCount, 1, dc.firstVertex, 0);
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // OFFSCREEN RESOURCES
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -786,6 +915,9 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
             cmd.draw(gridVertexCount, 1, 0, 0);
             gridRendered = true;
         });
+
+        // ── LIGHT GIZMOS ──
+        drawLightGizmos(cmd, imageIndex);
     }
 
     cmd.endRenderPass();
@@ -829,6 +961,7 @@ bool Renderer::drawFrame(vk::Device device, vk::SwapchainKHR swapchain,
         updateGridBuffer(device);
         initialized = true;
     }
+    updateGizmoBuffer(device);
 
     // Sync preferences → engine state
     camera.moveSpeed = ui.getCameraMoveSpeed();

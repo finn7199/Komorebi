@@ -181,6 +181,24 @@ private:
     // ── Init Helpers ──
     uint32_t gridVertexCount = 0;
 
+    // ── Light Gizmos ──
+    struct GizmoDrawCmd {
+        uint32_t firstVertex;
+        uint32_t vertexCount;
+        glm::vec4 color;
+        bool selected;
+    };
+    std::vector<GizmoDrawCmd> gizmoDraws;
+
+    void updateGizmoBuffer(vk::Device device);
+    void drawLightGizmos(vk::CommandBuffer cmd, uint32_t imageIndex);
+    static void appendCross(std::vector<glm::vec3>& out, const glm::vec3& c, float s);
+    static void appendSphereRings(std::vector<glm::vec3>& out, const glm::vec3& c, float r, int seg);
+    static void appendSpotCone(std::vector<glm::vec3>& out, const glm::vec3& apex,
+                               const glm::vec3& dir, float angleDeg, float range, int seg);
+    static void appendDirArrows(std::vector<glm::vec3>& out, const glm::vec3& origin,
+                                const glm::vec3& dir, float len);
+
     void createOffscreenPass(vk::Device device);
     void createGridPipeline(vk::Device device);
     void updateGridBuffer(vk::Device device);

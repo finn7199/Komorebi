@@ -287,6 +287,8 @@ void Core::createLogicalDevice() {
     // Enable required features
     vk::PhysicalDeviceFeatures supportedFeatures = physicalDevice.getFeatures();
     vk::PhysicalDeviceFeatures deviceFeatures{};
+    if (supportedFeatures.fillModeNonSolid)
+        deviceFeatures.fillModeNonSolid = VK_TRUE;
 
     // Vulkan 1.3 features — needed for runtime-compiled shaders that use 1.3 capabilities
     vk::PhysicalDeviceVulkan13Features features13{};

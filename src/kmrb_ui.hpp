@@ -102,6 +102,8 @@ public:
     int getParticleCount() const { return particleCount; }
     bool isRenderResolutionDirty() { bool d = renderResDirty; renderResDirty = false; return d; }
     bool isParticleCountDirty() { bool d = particleCountDirty; particleCountDirty = false; return d; }
+    bool getShowGizmos() const { return showGizmos; }
+    entt::entity getSelectedEntity() const { return selectedEntity; }
 
     // Handle swapchain recreation
     void onSwapchainRecreate(uint32_t newImageCount);
@@ -139,6 +141,7 @@ private:
     void* meshInstancesPtr = nullptr;
 
     // Preferences
+    bool showGizmos = true;
     int renderWidth = 1920;
     int renderHeight = 1080;
     bool renderResDirty = false;

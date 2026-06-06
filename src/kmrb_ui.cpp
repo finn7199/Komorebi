@@ -1998,6 +1998,17 @@ void UI::drawPreferences() {
 
         ImGui::Spacing();
 
+        // ── Viewport ──
+        if (ImGui::CollapsingHeader("Viewport", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextColored(hex(0x8B7D6B), "Light Gizmos");
+            ImGui::SameLine(160);
+            ImGui::Checkbox("##show_gizmos", &showGizmos);
+            ImGui::SameLine();
+            ImGui::TextColored(hex(0x5C5347), "Show light position/direction in viewport");
+        }
+
+        ImGui::Spacing();
+
         // ── Data ──
         if (ImGui::CollapsingHeader("Data Output", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::TextColored(hex(0x8B7D6B), "Refresh Interval");
