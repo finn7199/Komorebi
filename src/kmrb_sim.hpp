@@ -88,41 +88,16 @@ struct LightComponent {
 
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// PARTICLE DATA (used by Simulation::syncToSSBO, kept separate from ECS scene)
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-// Tag for individual particle entities (the 10k entities, not the system entity)
-struct ParticleTag {};
-
-// Lightweight position for particles (10k+ entities — don't need full Transform)
-struct ParticlePosition {
-    glm::vec3 pos;
-};
-
-struct Velocity {
-    glm::vec3 vel;
-};
-
-struct Mass {
-    float value = 1.0f;
-};
-
-struct PointSize {
-    float size = 2.0f;
-};
-
-struct Color {
-    glm::vec4 rgba = { 1.0f, 1.0f, 1.0f, 1.0f };
-};
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // SIMULATION
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Particle state lives entirely on the GPU (the user's init compute shader
+// fills it). The CPU side only tracks the count and provides a zeroed buffer
+// for the initial SSBO upload.
 
 class Simulation {
 public:
-    void init(entt::registry& registry, uint32_t count);
-    std::vector<Particle> syncToSSBO(entt::registry& registry);
+    void init(uint32_t count);
+    std::vector<Particle> makeInitialSSBOData() const;
     uint32_t getParticleCount() const { return particleCount; }
 
 private:

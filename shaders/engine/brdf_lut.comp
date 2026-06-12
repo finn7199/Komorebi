@@ -1,0 +1,62 @@
+#version 450
+#include "kmrb_ibl_common.glsl"
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BRDF integration LUT — the second half of the split-sum approximation.
+//
+// For every (NdotV, roughness) pair, pre-integrate the GGX BRDF over the
+// whole specular lobe assuming a white environment. The result is a scale
+// and bias for F0:   specular = prefiltered × (F0 * lut.x + lut.y)
+//
+// This table depends only on the BRDF — never on the loaded HDR — so the
+// engine bakes it exactly once at startup.
+//   x axis = NdotV (viewing angle),  y axis = roughness
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// rgba16f instead of rg16f: RGBA16F storage images are mandatory in Vulkan,
+// RG16F requires an optional feature. Two wasted channels on a 512² LUT is 1 MB.
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dstLUT;
+
+const uint SAMPLE_COUNT = 1024u;
+
+void main() {
+    ivec2 px   = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(dstLUT);
+    if (px.x >= size.x || px.y >= size.y) return;
+
+    float NdotV     = (float(px.x) + 0.5) / float(size.x);
+    float roughness = (float(px.y) + 0.5) / float(size.y);
+
+    // The integral only depends on the angle between N and V, so we can fix
+    // N = +Z and place V in the XZ plane without loss of generality.
+    vec3 N = vec3(0.0, 0.0, 1.0);
+    vec3 V = vec3(sqrt(1.0 - NdotV * NdotV), 0.0, NdotV);
+
+    float scale = 0.0; // multiplies F0
+    float bias  = 0.0; // added regardless of F0 (grazing-angle reflection)
+
+    for (uint i = 0u; i < SAMPLE_COUNT; i++) {
+        vec2 Xi = kmrb_hammersley(i, SAMPLE_COUNT);
+        vec3 H  = kmrb_importanceSampleGGX(Xi, N, roughness);
+        vec3 L  = normalize(2.0 * dot(V, H) * H - V); // reflect V about H
+
+        float NdotL = max(L.z, 0.0);
+        float NdotH = max(H.z, 0.0);
+        float VdotH = max(dot(V, H), 0.0);
+
+        if (NdotL > 0.0) {
+            float G     = kmrb_G_SmithIBL(NdotV, NdotL, roughness);
+            // BRDF / pdf, with the GGX D term cancelling out of both
+            float G_Vis = (G * VdotH) / (NdotH * NdotV);
+            // Split Fresnel into its F0-dependent and constant parts
+            float Fc    = pow(1.0 - VdotH, 5.0);
+            scale += (1.0 - Fc) * G_Vis;
+            bias  += Fc * G_Vis;
+        }
+    }
+
+    imageStore(dstLUT, px, vec4(scale / float(SAMPLE_COUNT),
+                                bias  / float(SAMPLE_COUNT), 0.0, 0.0));
+}

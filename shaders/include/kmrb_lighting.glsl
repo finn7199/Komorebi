@@ -30,6 +30,13 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     int lightCount;
 } global;
 
+// ── IBL inputs (Set 1) — baked by the engine from the loaded HDR ────────────
+// Black until an HDR is loaded (Assets ▸ environment). The raw skybox cubemap
+// is also available at binding 0: layout(set = 1, binding = 0) uniform samplerCube envMap;
+layout(set = 1, binding = 1) uniform samplerCube irradianceMap;  // diffuse: cosine-convolved env
+layout(set = 1, binding = 2) uniform samplerCube prefilteredMap; // specular: GGX-convolved env, mip = roughness
+layout(set = 1, binding = 3) uniform sampler2D   brdfLUT;        // split-sum BRDF table (NdotV, roughness)
+
 // Resolved per-light data — output of kmrb_resolveLight().
 struct KmrbLight {
     vec3  L;     // direction from the fragment toward the light (normalized)
@@ -114,6 +121,36 @@ vec3 kmrb_F_Schlick(float HdotV, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - HdotV, 0.0, 1.0), 5.0);
 }
 
+// Fresnel for ambient/IBL: rough surfaces can't reach full grazing reflection
+// (their microfacets scatter it), so the max reflectance is damped by roughness.
+vec3 kmrb_F_SchlickRoughness(float NdotV, vec3 F0, float roughness) {
+    return F0 + (max(vec3(1.0 - roughness), F0) - F0)
+              * pow(clamp(1.0 - NdotV, 0.0, 1.0), 5.0);
+}
+
+// Image-based lighting — ambient light arriving from the environment map.
+// Split-sum approximation over the engine-baked textures:
+//   diffuse  = one fetch from the irradiance map along N
+//   specular = GGX-blurred env fetch along R  ×  BRDF LUT (scale/bias for F0)
+// Returns black when no HDR is loaded (the maps are baked from a black placeholder).
+vec3 kmrb_ibl(vec3 N, vec3 V, vec3 albedo, float metallic, float roughness, vec3 F0) {
+    float NdotV = max(dot(N, V), 0.001);
+    vec3  F  = kmrb_F_SchlickRoughness(NdotV, F0, roughness);
+    vec3  kD = (vec3(1.0) - F) * (1.0 - metallic); // metals: no diffuse, like the analytic path
+
+    // Diffuse: hemisphere integral was precomputed — single fetch along the normal
+    vec3 diffuse = kD * texture(irradianceMap, N).rgb * albedo;
+
+    // Specular: pick the mip whose GGX blur matches this surface's roughness
+    vec3  R      = reflect(-V, N);
+    float maxMip = float(textureQueryLevels(prefilteredMap) - 1);
+    vec3  prefiltered = textureLod(prefilteredMap, R, roughness * maxMip).rgb;
+    vec2  brdf   = texture(brdfLUT, vec2(NdotV, roughness)).rg;
+    vec3  specular = prefiltered * (F * brdf.x + brdf.y);
+
+    return diffuse + specular;
+}
+
 // Cook-Torrance PBR shading summed over all scene lights.
 //   worldPos  — fragment position in world space
 //   N         — surface normal, normalized
@@ -152,7 +189,9 @@ vec3 kmrb_pbr(vec3 worldPos, vec3 N, vec3 V, vec3 albedo, float metallic, float 
         Lo += (kD * albedo / KMRB_PI + specular) * light.color * light.atten * NdotL;
     }
 
-    vec3 ambient = vec3(0.03) * albedo; // simple flat ambient; replace with IBL for full PBR
+    // Ambient from the environment map (IBL). The small flat term keeps meshes
+    // visible when no HDR is loaded (IBL maps are black then).
+    vec3 ambient = kmrb_ibl(N, V, albedo, metallic, roughness, F0) + vec3(0.02) * albedo;
     return ambient + Lo;
 }
 

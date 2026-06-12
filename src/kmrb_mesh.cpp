@@ -1,5 +1,5 @@
 #include "kmrb_mesh.hpp"
-#include "kmrb_ui.hpp"
+#include "kmrb_log.hpp"
 
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
@@ -71,13 +71,14 @@ void MeshCache::uploadToGPU(const std::string& key, const MeshData& data, Buffer
     vk::DeviceSize vtxSize = data.vertices.size() * sizeof(MeshVertex);
     vk::DeviceSize idxSize = data.indices.size() * sizeof(uint32_t);
 
+    // Device-local: mesh data is written once and read by the GPU every frame
     buffers.createBufferWithData(vtxName, data.vertices.data(), vtxSize,
         vk::BufferUsageFlagBits::eVertexBuffer,
-        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        vk::MemoryPropertyFlagBits::eDeviceLocal);
 
     buffers.createBufferWithData(idxName, data.indices.data(), idxSize,
         vk::BufferUsageFlagBits::eIndexBuffer,
-        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        vk::MemoryPropertyFlagBits::eDeviceLocal);
 
     GPUMesh mesh;
     mesh.sourceFile = key;

@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <filesystem>
+#include <chrono>
 
 #include "kmrb_types.hpp"
 #include "kmrb_buffers.hpp"
@@ -79,6 +80,11 @@ public:
         std::filesystem::file_time_type initModTime{}, compModTime{}, vertModTime{}, fragModTime{};
         bool initPending = false;                // True = init shader needs to dispatch (once)
 
+        // Workgroup sizes read from the compiled SPIR-V (local_size_x in the user's GLSL).
+        // The dispatch count is derived from these so users can pick any workgroup size.
+        uint32_t initLocalSizeX = 256;
+        uint32_t computeLocalSizeX = 256;
+
         // Reflection data — populated by reflectPushConstants() after SPIR-V compilation
         std::vector<ReflectedParam> reflectedParams;   // User-tweakable params (excludes engine built-ins)
         std::vector<uint8_t> pushConstantData;          // Live values written to GPU each frame
@@ -123,8 +129,40 @@ private:
     vk::DeviceMemory envCubemapMemory = nullptr;
     vk::ImageView envCubemapView = nullptr;
     vk::Sampler envSampler = nullptr;
-    vk::DescriptorSet envDescriptorSet = nullptr;   // Set 1: environment cubemap
+    vk::DescriptorSet envDescriptorSet = nullptr;   // Set 1: environment cubemap + IBL maps
     bool envMapLoaded = false;
+
+    // ── IBL (image-based lighting) — precomputed maps the PBR shaders sample ──
+    // Fixed-size images created once at init; contents re-baked on every HDR
+    // load/clear by dispatching the engine compute shaders in shaders/engine/.
+    static constexpr uint32_t IBL_IRRADIANCE_SIZE  = 32;   // diffuse map, per face
+    static constexpr uint32_t IBL_PREFILTERED_SIZE = 128;  // specular map mip 0, per face
+    static constexpr uint32_t IBL_PREFILTER_MIPS   = 5;    // 128 → 8, one roughness per mip
+    static constexpr uint32_t IBL_BRDF_LUT_SIZE    = 512;
+
+    vk::Image        iblIrradiance = nullptr;               // Set 1, binding 1
+    vk::DeviceMemory iblIrradianceMemory = nullptr;
+    vk::ImageView    iblIrradianceView = nullptr;            // cube view (sampling)
+    vk::ImageView    iblIrradianceStorageView = nullptr;     // 2D-array view (compute write)
+    vk::Sampler      iblIrradianceSampler = nullptr;
+
+    vk::Image        iblPrefiltered = nullptr;               // Set 1, binding 2
+    vk::DeviceMemory iblPrefilteredMemory = nullptr;
+    vk::ImageView    iblPrefilteredView = nullptr;            // cube view, all mips (sampling)
+    std::array<vk::ImageView, IBL_PREFILTER_MIPS> iblPrefilteredMipViews{}; // per-mip write targets
+    vk::Sampler      iblPrefilteredSampler = nullptr;         // maxLod unclamped → textureLod works
+
+    vk::Image        iblBrdfLut = nullptr;                   // Set 1, binding 3
+    vk::DeviceMemory iblBrdfLutMemory = nullptr;
+    vk::ImageView    iblBrdfLutView = nullptr;
+    vk::Sampler      iblBrdfLutSampler = nullptr;
+
+    // Bake pipelines — separate layout from the main one (needs storage images)
+    vk::DescriptorSetLayout iblBakeSetLayout = nullptr;  // 0: samplerCube src, 1: storage image dst
+    vk::PipelineLayout      iblBakePipelineLayout = nullptr;
+    vk::Pipeline            iblBrdfPipeline = nullptr;
+    vk::Pipeline            iblIrradiancePipeline = nullptr;
+    vk::Pipeline            iblPrefilterPipeline = nullptr;
 
     // ── Offscreen Framebuffer (simulation viewport) ──
     vk::Image offscreenColor;
@@ -177,6 +215,12 @@ private:
     float elapsedTime = 0.0f;
     float computeTime = 0.0f;
 
+    // ── Frame timing & periodic work (members, not function statics) ──
+    std::chrono::steady_clock::time_point appStartTime;   // For the shader 'time' uniform
+    std::chrono::steady_clock::time_point lastFrameTime;  // For real per-frame delta
+    uint32_t hotReloadCounter = 0;   // Frames since the last shader file poll
+    bool firstSyncDone = false;      // Initial shader/mesh instance sync happened
+
 
     // ── Init Helpers ──
     uint32_t gridVertexCount = 0;
@@ -189,6 +233,7 @@ private:
         bool selected;
     };
     std::vector<GizmoDrawCmd> gizmoDraws;
+    std::vector<glm::vec3> gizmoVerts;   // Scratch buffer, reused every frame
 
     void updateGizmoBuffer(vk::Device device);
     void drawLightGizmos(vk::CommandBuffer cmd, uint32_t imageIndex);
@@ -220,17 +265,20 @@ private:
     void recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex);
     void updateGlobalUBO(uint32_t imageIndex);
 
-    // Shader instance management — syncs ECS ShaderProgramComponents to Vulkan pipelines
+    // Shader instance management — syncs ECS ShaderProgramComponents to Vulkan pipelines.
+    // Builders take pre-compiled SPIR-V so each shader is compiled exactly once
+    // (the same SPIR-V is also fed to reflection).
     void syncShaderInstances(vk::Device device);
     void destroyShaderInstance(vk::Device device, ShaderInstance& inst);
-    vk::Pipeline buildComputePipeline(vk::Device device, const std::string& path);
-    vk::Pipeline buildGraphicsPipeline(vk::Device device, const std::string& vertPath, const std::string& fragPath);
+    vk::Pipeline buildComputePipeline(vk::Device device, const std::vector<uint32_t>& spirv);
+    vk::Pipeline buildGraphicsPipeline(vk::Device device, const std::vector<uint32_t>& vertSpirv,
+                                       const std::vector<uint32_t>& fragSpirv);
 
     // Mesh instance management — syncs MeshRendererComponents to Vulkan pipelines
     void syncMeshInstances(vk::Device device);
     void destroyMeshInstance(vk::Device device, MeshShaderInstance& inst);
-    vk::Pipeline buildMeshGraphicsPipeline(vk::Device device, const std::string& vertPath,
-                                           const std::string& fragPath, bool wireframe);
+    vk::Pipeline buildMeshGraphicsPipeline(vk::Device device, const std::vector<uint32_t>& vertSpirv,
+                                           const std::vector<uint32_t>& fragSpirv, bool wireframe);
 
     // SPIRV-Reflect: extract push constant members from compiled SPIR-V bytecode.
     // Populates inst.reflectedParams with user-tweakable params (skips engine built-ins like model/color).
@@ -241,6 +289,13 @@ private:
     void destroyEnvironmentMap(vk::Device device);
     void createSkyboxPipeline(vk::Device device);
     void createPlaceholderCubemap(vk::Device device);  // 1x1 black cubemap for unbound state
+
+    // IBL — images/pipelines at init (+ one-time BRDF LUT bake), then
+    // bakeIBLMaps() re-convolves irradiance/prefiltered from the current envMap
+    void createIBLResources(vk::Device device);
+    void bakeIBLMaps(vk::Device device);
+    void destroyIBLResources(vk::Device device);
+    void writeIBLDescriptors(vk::Device device);  // bindings 1-3 of envDescriptorSet
 
     vk::ShaderModule createShaderModule(vk::Device device, const std::vector<char>& code);
     static std::vector<char> readFile(const std::string& filename);

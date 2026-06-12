@@ -623,34 +623,27 @@ void UI::drawProjectBrowser() {
         if (projectRoot.empty()) {
             ImGui::TextColored(hex(0x5C5347), "No project root set");
         } else {
-            namespace fs = std::filesystem;
+            // Refresh the cached tree on a timer instead of scanning every frame
+            projectTreeTimer += ImGui::GetIO().DeltaTime;
+            if (projectTreeTimer >= PROJECT_TREE_REFRESH_SEC) {
+                projectTreeTimer = 0.0f;
+                refreshProjectTree();
+            }
 
-            // Show content directories and root-level files (HDR, etc.)
-            std::string shadersDir = projectRoot + "/shaders";
-            std::string scenesDir = projectRoot + "/scenes";
-
-            if (fs::exists(shadersDir) && ImGui::TreeNodeEx("shaders", ImGuiTreeNodeFlags_DefaultOpen)) {
-                drawFileTree(shadersDir);
+            if (!shaderTree.fullPath.empty() && ImGui::TreeNodeEx("shaders", ImGuiTreeNodeFlags_DefaultOpen)) {
+                drawFileTreeNodes(shaderTree.children);
                 ImGui::TreePop();
             }
 
-            // Models folder
-            std::string modelsDir = projectRoot + "/models";
-            if (fs::exists(modelsDir) && ImGui::TreeNodeEx("models", ImGuiTreeNodeFlags_DefaultOpen)) {
-                drawFileTree(modelsDir);
+            if (!modelTree.fullPath.empty() && ImGui::TreeNodeEx("models", ImGuiTreeNodeFlags_DefaultOpen)) {
+                drawFileTreeNodes(modelTree.children);
                 ImGui::TreePop();
             }
 
-            // Root-level asset files (HDR images, etc.) — shown without a subfolder.
-            // Only shows supported file types, skips directories.
-            for (auto& entry : fs::directory_iterator(projectRoot)) {
-                if (!entry.is_regular_file()) continue;
-                auto ext = entry.path().extension().string();
-                if (ext != ".hdr") continue;  // Only show supported root-level asset types
-
-                std::string name = entry.path().filename().string();
-                std::string fullPath = entry.path().string();
-                std::replace(fullPath.begin(), fullPath.end(), '\\', '/');
+            // Root-level asset files (HDR images, etc.) — shown without a subfolder
+            for (const auto& node : rootAssets) {
+                const std::string& name = node.name;
+                const std::string& fullPath = node.fullPath;
 
                 ImGuiTreeNodeFlags fileFlags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
                 if (selectedFile == fullPath) fileFlags |= ImGuiTreeNodeFlags_Selected;
@@ -676,8 +669,8 @@ void UI::drawProjectBrowser() {
                 }
             }
 
-            if (fs::exists(scenesDir) && ImGui::TreeNodeEx("scenes", ImGuiTreeNodeFlags_DefaultOpen)) {
-                drawFileTree(scenesDir);
+            if (!sceneTree.fullPath.empty() && ImGui::TreeNodeEx("scenes", ImGuiTreeNodeFlags_DefaultOpen)) {
+                drawFileTreeNodes(sceneTree.children);
                 ImGui::TreePop();
             } else {
                 // Create scenes dir if it doesn't exist yet, show as empty
@@ -694,49 +687,92 @@ void UI::drawProjectBrowser() {
     ImGui::End();
 }
 
-void UI::drawFileTree(const std::string& directory) {
+// Rebuild the cached file tree from disk. Called on a timer, not per frame.
+void UI::refreshProjectTree() {
     namespace fs = std::filesystem;
 
-    if (!fs::exists(directory) || !fs::is_directory(directory)) return;
+    auto scanDir = [](const std::string& dir, FileTreeNode& node) {
+        node = {};
+        if (!fs::exists(dir) || !fs::is_directory(dir)) return;
+        node.fullPath = dir;   // Non-empty fullPath = directory exists
+        node.isDir = true;
+        buildFileTree(dir, node);
+    };
 
-    // Collect and sort entries (folders first, then files)
-    std::vector<fs::directory_entry> folders, files;
+    scanDir(projectRoot + "/shaders", shaderTree);
+    scanDir(projectRoot + "/models", modelTree);
+    scanDir(projectRoot + "/scenes", sceneTree);
+
+    // Root-level asset files (HDR images, etc.)
+    rootAssets.clear();
+    for (auto& entry : fs::directory_iterator(projectRoot)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension().string() != ".hdr") continue;
+        FileTreeNode file;
+        file.name = entry.path().filename().string();
+        file.fullPath = entry.path().generic_string();  // Forward slashes
+        file.ext = ".hdr";
+        rootAssets.push_back(std::move(file));
+    }
+}
+
+// Recursively snapshot a directory into FileTreeNode children (folders first, sorted)
+void UI::buildFileTree(const std::string& directory, FileTreeNode& node) {
+    namespace fs = std::filesystem;
+
+    std::vector<FileTreeNode> folders, files;
     for (auto& entry : fs::directory_iterator(directory)) {
         if (entry.is_directory()) {
             // Skip hidden/build/external dirs
             auto name = entry.path().filename().string();
             if (name[0] == '.' || name == "build" || name == "external" || name == "engine") continue;
-            folders.push_back(entry);
+            FileTreeNode folder;
+            folder.name = name;
+            folder.fullPath = entry.path().generic_string();
+            folder.isDir = true;
+            buildFileTree(folder.fullPath, folder); // Recurse
+            folders.push_back(std::move(folder));
         } else {
             auto ext = entry.path().extension().string();
             // Only show shader, scene, HDR, and mesh files
             if (ext == ".comp" || ext == ".vert" || ext == ".frag"
                 || ext == ".glsl" || ext == ".kmrb" || ext == ".ksfx" || ext == ".hdr"
                 || ext == ".fbx" || ext == ".obj" || ext == ".gltf" || ext == ".glb") {
-                files.push_back(entry);
+                FileTreeNode file;
+                file.name = entry.path().filename().string();
+                file.fullPath = entry.path().generic_string();
+                file.ext = ext;
+                files.push_back(std::move(file));
             }
         }
     }
 
-    std::sort(folders.begin(), folders.end());
-    std::sort(files.begin(), files.end());
+    auto byName = [](const FileTreeNode& a, const FileTreeNode& b) { return a.name < b.name; };
+    std::sort(folders.begin(), folders.end(), byName);
+    std::sort(files.begin(), files.end(), byName);
 
+    node.children.reserve(folders.size() + files.size());
+    for (auto& f : folders) node.children.push_back(std::move(f));
+    for (auto& f : files)   node.children.push_back(std::move(f));
+}
+
+// Draw cached tree nodes — no filesystem access here
+void UI::drawFileTreeNodes(const std::vector<FileTreeNode>& nodes) {
     // Folders as collapsible tree nodes
-    for (auto& folder : folders) {
-        auto name = folder.path().filename().string();
-        ImGuiTreeNodeFlags folderFlags = ImGuiTreeNodeFlags_OpenOnArrow;
-
-        if (ImGui::TreeNodeEx(name.c_str(), folderFlags)) {
-            drawFileTree(folder.path().string()); // Recurse
+    for (const auto& node : nodes) {
+        if (!node.isDir) continue;
+        if (ImGui::TreeNodeEx(node.name.c_str(), ImGuiTreeNodeFlags_OpenOnArrow)) {
+            drawFileTreeNodes(node.children);
             ImGui::TreePop();
         }
     }
 
     // Files as selectable items
-    for (auto& file : files) {
-        auto name = file.path().filename().string();
-        auto fullPath = file.path().string();
-        auto ext = file.path().extension().string();
+    for (const auto& node : nodes) {
+        if (node.isDir) continue;
+        const std::string& name = node.name;
+        const std::string& fullPath = node.fullPath;
+        const std::string& ext = node.ext;
 
         bool isSelected = (selectedFile == fullPath);
         ImGuiTreeNodeFlags fileFlags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
@@ -816,6 +852,7 @@ void UI::drawFileTree(const std::string& directory) {
             if (ImGui::MenuItem("Delete")) {
                 std::filesystem::remove(fullPath);
                 if (selectedFile == fullPath) selectedFile.clear();
+                projectTreeTimer = PROJECT_TREE_REFRESH_SEC;  // Refresh tree next frame
                 kmrb::Log::warn("Deleted: " + name);
             }
             ImGui::PopStyleColor();
@@ -2021,30 +2058,6 @@ void UI::drawPreferences() {
     }
     ImGui::End();
 }
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// LOG SYSTEM
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-std::deque<LogEntry> Log::entries;
-std::chrono::steady_clock::time_point Log::startTime = std::chrono::steady_clock::now();
-
-void Log::add(LogLevel level, const std::string& msg) {
-    float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - startTime).count();
-    entries.push_back({ t, level, msg });
-    if (entries.size() > MAX_ENTRIES) entries.pop_front();
-}
-
-void Log::info(const std::string& msg)  { add(LogLevel::Info, msg); }
-void Log::ok(const std::string& msg)    { add(LogLevel::Ok, msg); }
-void Log::warn(const std::string& msg)  { add(LogLevel::Warn, msg); }
-void Log::error(const std::string& msg) { add(LogLevel::Error, msg); }
-void Log::clear()                       { entries.clear(); }
-const std::deque<LogEntry>& Log::getEntries() { return entries; }
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// FRAME LIFECYCLE
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // FILE DIALOGS & SCENE I/O

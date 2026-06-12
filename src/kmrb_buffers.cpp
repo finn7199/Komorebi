@@ -1,4 +1,4 @@
-#include "kmrb_ui.hpp"
+#include "kmrb_log.hpp"
 #include "kmrb_buffers.hpp"
 #include <iostream>
 #include <fstream>
@@ -10,6 +10,51 @@ namespace kmrb {
 void BufferManager::init(vk::Device dev, vk::PhysicalDevice gpu) {
     device = dev;
     physicalDevice = gpu;
+}
+
+void BufferManager::setTransferContext(vk::CommandPool pool, vk::Queue queue) {
+    transferPool = pool;
+    transferQueue = queue;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// STAGING HELPERS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Device-local (VRAM) buffers can't be mapped by the CPU. Data travels through
+// a small host-visible "staging" buffer and a GPU copy command instead.
+
+vk::CommandBuffer BufferManager::beginOneShot() {
+    if (!transferPool || !transferQueue) {
+        throw std::runtime_error("KMRB BufferManager: transfer context not set (call setTransferContext)");
+    }
+    vk::CommandBuffer cmd = device.allocateCommandBuffers(
+        vk::CommandBufferAllocateInfo(transferPool, vk::CommandBufferLevel::ePrimary, 1))[0];
+    cmd.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+    return cmd;
+}
+
+void BufferManager::endOneShot(vk::CommandBuffer cmd) {
+    cmd.end();
+    transferQueue.submit(vk::SubmitInfo({}, {}, cmd));
+    transferQueue.waitIdle();  // Block until the copy finishes — fine for load-time transfers
+    device.freeCommandBuffers(transferPool, cmd);
+}
+
+BufferManager::StagingBuffer BufferManager::createStaging(vk::DeviceSize size) {
+    StagingBuffer staging;
+    staging.buffer = device.createBuffer(vk::BufferCreateInfo(
+        {}, size, vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst));
+    vk::MemoryRequirements reqs = device.getBufferMemoryRequirements(staging.buffer);
+    staging.memory = device.allocateMemory(vk::MemoryAllocateInfo(
+        reqs.size, findMemoryType(reqs.memoryTypeBits,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)));
+    device.bindBufferMemory(staging.buffer, staging.memory, 0);
+    return staging;
+}
+
+void BufferManager::destroyStaging(StagingBuffer& staging) {
+    device.destroyBuffer(staging.buffer);
+    device.freeMemory(staging.memory);
 }
 
 void BufferManager::cleanup() {
@@ -35,6 +80,12 @@ void BufferManager::createBuffer(const std::string& name,
     BufferInfo info{};
     info.name = name;
     info.size = size;
+    info.hostVisible = static_cast<bool>(memoryProperties & vk::MemoryPropertyFlagBits::eHostVisible);
+
+    // Device-local buffers need transfer usage so upload()/readBack() can stage data
+    if (!info.hostVisible) {
+        usage |= vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc;
+    }
     info.usage = usage;
 
     info.buffer = device.createBuffer(vk::BufferCreateInfo({}, size, usage));
@@ -58,20 +109,30 @@ void BufferManager::createBufferWithData(const std::string& name,
                                          vk::BufferUsageFlags usage,
                                          vk::MemoryPropertyFlags memoryProperties) {
     createBuffer(name, size, usage, memoryProperties, false);
-
-    void* mapped = device.mapMemory(buffers[name].memory, 0, size);
-    memcpy(mapped, data, size);
-    device.unmapMemory(buffers[name].memory);
+    upload(name, data, size);  // Handles both mapped and staged (device-local) paths
 }
 
 void BufferManager::upload(const std::string& name, const void* data, vk::DeviceSize size) {
     auto& info = getInfo(name);
+
     if (info.mapped) {
         memcpy(info.mapped, data, size);
-    } else {
+    } else if (info.hostVisible) {
         void* mapped = device.mapMemory(info.memory, 0, size);
         memcpy(mapped, data, size);
         device.unmapMemory(info.memory);
+    } else {
+        // Device-local: write into a staging buffer, then GPU-copy staging → VRAM
+        StagingBuffer staging = createStaging(size);
+        void* mapped = device.mapMemory(staging.memory, 0, size);
+        memcpy(mapped, data, size);
+        device.unmapMemory(staging.memory);
+
+        vk::CommandBuffer cmd = beginOneShot();
+        cmd.copyBuffer(staging.buffer, info.buffer, vk::BufferCopy(0, 0, size));
+        endOneShot(cmd);
+
+        destroyStaging(staging);
     }
 }
 
@@ -130,11 +191,24 @@ std::vector<float> BufferManager::readBack(const std::string& name) {
     if (info.mapped) {
         // Already mapped — just copy
         memcpy(data.data(), info.mapped, info.size);
-    } else {
+    } else if (info.hostVisible) {
         // Map, copy, unmap
         void* mapped = device.mapMemory(info.memory, 0, info.size);
         memcpy(data.data(), mapped, info.size);
         device.unmapMemory(info.memory);
+    } else {
+        // Device-local: GPU-copy VRAM → staging, wait, then read the staging buffer.
+        // The wait also guarantees in-flight compute writes are done — no torn reads.
+        StagingBuffer staging = createStaging(info.size);
+
+        vk::CommandBuffer cmd = beginOneShot();
+        cmd.copyBuffer(info.buffer, staging.buffer, vk::BufferCopy(0, 0, info.size));
+        endOneShot(cmd);
+
+        void* mapped = device.mapMemory(staging.memory, 0, info.size);
+        memcpy(data.data(), mapped, info.size);
+        device.unmapMemory(staging.memory);
+        destroyStaging(staging);
     }
 
     return data;

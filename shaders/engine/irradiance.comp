@@ -1,0 +1,63 @@
+#version 450
+#include "kmrb_ibl_common.glsl"
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Irradiance map — the diffuse half of IBL.
+//
+// A matte surface facing direction N receives light from the *entire*
+// hemisphere around N, weighted by cosθ (Lambert). This shader bakes that
+// hemisphere integral into a tiny cubemap: each texel direction N stores the
+// total cosine-weighted radiance arriving from the sky around it.
+//
+// At runtime the diffuse ambient term is then a single texture fetch:
+//   diffuse = albedo * texture(irradianceMap, N).rgb
+//
+// 32×32 per face is enough — irradiance is extremely low-frequency (blurring
+// the entire hemisphere destroys all detail anyway).
+// Re-baked by the engine every time a new HDR is loaded.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform samplerCube srcEnv;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2DArray dstIrradiance;
+
+void main() {
+    ivec3 texel = ivec3(gl_GlobalInvocationID);
+    int faceSize = imageSize(dstIrradiance).x;
+    if (texel.x >= faceSize || texel.y >= faceSize) return;
+
+    // The normal this texel represents, and a tangent basis around it
+    vec3 N = kmrb_cubeDir(texel, faceSize);
+    vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent   = normalize(cross(up, N));
+    vec3 bitangent = cross(N, tangent);
+
+    // Walk the hemisphere in spherical coordinates and average the samples.
+    // Weight cos(θ)·sin(θ): cos for Lambert, sin because cells near the pole
+    // are smaller than cells near the equator (spherical area element).
+    const float sampleDelta = 0.025;
+    vec3  irradiance = vec3(0.0);
+    float sampleCount = 0.0;
+
+    for (float phi = 0.0; phi < 2.0 * KMRB_IBL_PI; phi += sampleDelta) {
+        for (float theta = 0.0; theta < 0.5 * KMRB_IBL_PI; theta += sampleDelta) {
+            // Tangent-space direction → world space around N
+            vec3 tangentDir = vec3(sin(theta) * cos(phi),
+                                   sin(theta) * sin(phi),
+                                   cos(theta));
+            vec3 sampleDir = tangentDir.x * tangent
+                           + tangentDir.y * bitangent
+                           + tangentDir.z * N;
+
+            irradiance += texture(srcEnv, sampleDir).rgb * cos(theta) * sin(theta);
+            sampleCount += 1.0;
+        }
+    }
+
+    // π factor: the Lambert BRDF is albedo/π; folding π in here means the
+    // runtime shader can just multiply by albedo.
+    irradiance = KMRB_IBL_PI * irradiance / sampleCount;
+
+    imageStore(dstIrradiance, texel, vec4(irradiance, 1.0));
+}

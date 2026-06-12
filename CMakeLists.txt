@@ -40,6 +40,8 @@ add_executable(Komorebi
     src/kmrb_buffers.hpp
     src/kmrb_ui.cpp
     src/kmrb_ui.hpp
+    src/kmrb_log.cpp
+    src/kmrb_log.hpp
     src/kmrb_camera.cpp
     src/kmrb_camera.hpp
     src/kmrb_types.hpp

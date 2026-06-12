@@ -11,6 +11,8 @@
 #include <mutex>
 #include <entt/entt.hpp>
 
+#include "kmrb_log.hpp"
+
 namespace kmrb { class BufferManager; }
 
 namespace kmrb {
@@ -19,34 +21,6 @@ struct BufferInfo; // Forward declare
 
 // What kind of entity is selected in the hierarchy
 enum class SelectionType { None, Scene, Pipeline, Camera, Grid, Mesh, Light };
-
-// Log levels matching the KMRB color palette
-enum class LogLevel { Info, Ok, Warn, Error };
-
-struct LogEntry {
-    float timestamp;    // Seconds since app start
-    LogLevel level;
-    std::string message;
-};
-
-// Global log — call from anywhere, displayed in the Console panel
-class Log {
-public:
-    static void info(const std::string& msg);
-    static void ok(const std::string& msg);
-    static void warn(const std::string& msg);
-    static void error(const std::string& msg);
-    static void clear();
-
-    static const std::deque<LogEntry>& getEntries();
-
-private:
-    static void add(LogLevel level, const std::string& msg);
-    static std::deque<LogEntry> entries;
-    static std::chrono::steady_clock::time_point startTime;
-    static constexpr size_t MAX_ENTRIES = 500;
-};
-
 
 class UI {
 public:
@@ -169,6 +143,20 @@ private:
     entt::entity selectedEntity = entt::null;
     SelectionType selectionType = SelectionType::None;
 
+    // Project browser tree — cached snapshot of the filesystem, refreshed on a
+    // timer. Scanning directories every frame is far too slow for a draw loop.
+    struct FileTreeNode {
+        std::string name;        // Display name (filename)
+        std::string fullPath;    // Absolute path, forward slashes
+        std::string ext;         // File extension, empty for folders
+        bool isDir = false;
+        std::vector<FileTreeNode> children;
+    };
+    FileTreeNode shaderTree, modelTree, sceneTree;
+    std::vector<FileTreeNode> rootAssets;       // Root-level .hdr files
+    float projectTreeTimer = 1e9f;              // Large initial value → refresh on first frame
+    static constexpr float PROJECT_TREE_REFRESH_SEC = 2.0f;
+
     void drawMenuBar();
     void drawSceneHierarchy();
     void drawAddEntityMenu(); // "+" button / right-click context menu
@@ -176,7 +164,9 @@ private:
     void drawViewport(vk::DescriptorSet viewportTexture, vk::Extent2D viewportExtent,
                       uint32_t particleCount, float fps, float computeTime);
     void drawProjectBrowser();
-    void drawFileTree(const std::string& directory);
+    void refreshProjectTree();
+    static void buildFileTree(const std::string& directory, FileTreeNode& node);
+    void drawFileTreeNodes(const std::vector<FileTreeNode>& nodes);
     void drawInspector(uint32_t particleCount,
                        const std::unordered_map<std::string, BufferInfo>& buffers);
     void drawConsole();

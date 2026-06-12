@@ -15,6 +15,7 @@ struct BufferInfo {
     vk::DeviceSize size = 0;
     vk::BufferUsageFlags usage;
     void* mapped = nullptr;         // Non-null if persistently mapped
+    bool hostVisible = true;        // False = device-local (VRAM), needs staging for CPU access
     uint32_t elementCount = 0;      // Number of structs (for display)
     uint32_t elementStride = 0;     // Sizeof one element (for display)
 };
@@ -23,6 +24,10 @@ class BufferManager {
 public:
     void init(vk::Device device, vk::PhysicalDevice physicalDevice);
     void cleanup();
+
+    // Command pool + queue used for staging copies to/from device-local buffers.
+    // Must be set before creating any eDeviceLocal buffer.
+    void setTransferContext(vk::CommandPool pool, vk::Queue queue);
 
     // Create a named buffer. Returns a handle (the name) for later access.
     // If persistentMap is true, the buffer stays mapped for CPU writes.
@@ -71,9 +76,23 @@ public:
 private:
     vk::Device device;
     vk::PhysicalDevice physicalDevice;
+    vk::CommandPool transferPool;
+    vk::Queue transferQueue;
     std::unordered_map<std::string, BufferInfo> buffers;
 
     uint32_t findMemoryType(uint32_t typeFilter, vk::MemoryPropertyFlags properties);
+
+    // One-shot command buffer for staging copies (records, submits, waits)
+    vk::CommandBuffer beginOneShot();
+    void endOneShot(vk::CommandBuffer cmd);
+
+    // Temporary CPU-visible buffer used to ferry data to/from VRAM
+    struct StagingBuffer {
+        vk::Buffer buffer;
+        vk::DeviceMemory memory;
+    };
+    StagingBuffer createStaging(vk::DeviceSize size);
+    void destroyStaging(StagingBuffer& staging);
 };
 
 } // namespace kmrb

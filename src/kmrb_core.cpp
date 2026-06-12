@@ -15,8 +15,8 @@ void Core::init() {
     createSwapchain();
     createImageViews();
 
-    // Initialize ECS — create particle entities + scene objects
-    sim.init(registry, 10000);
+    // Particle state is GPU-resident — the sim only tracks the count
+    sim.init(10000);
 
     // Scene entities — every entity gets Name + Transform, then optional components
     auto pipeline = registry.create();
@@ -49,20 +49,16 @@ void Core::init() {
                   swapchainImageViews, indices.graphicsFamily.value(),
                   graphicsQueue, sim.getParticleCount());
 
-    // Sync ECS data to GPU
-    auto particles = sim.syncToSSBO(registry);
+    // Upload zeroed particle buffer — the init compute shader fills it on the GPU
+    auto particles = sim.makeInitialSSBOData();
     renderer.uploadParticles(device, particles);
 
     // Wire up UI callbacks
     renderer.getUI().setProjectRoot(KMRB_SHADER_DIR "/..");  // Points to repo root
     renderer.getUI().setOnReset([this]() {
         device.waitIdle();
-        // Only destroy particle entities, not scene objects (cameras, grids, etc.)
-        auto particleView = registry.view<ParticleTag>();
-        registry.destroy(particleView.begin(), particleView.end());
-        // Re-create particles and re-upload
-        sim.init(registry, 10000);
-        auto particles = sim.syncToSSBO(registry);
+        // Zero the SSBOs and re-run the init shader — particles live on the GPU
+        auto particles = sim.makeInitialSSBOData();
         renderer.uploadParticles(device, particles);
         renderer.requestInitDispatch();  // Re-run init shaders if assigned
         kmrb::Log::ok("Simulation reset");
@@ -192,10 +188,20 @@ void Core::pickPhysicalDevice() {
         throw std::runtime_error("KMRB: No GPUs with Vulkan support found!");
     }
 
+    // Score all suitable devices — prefer discrete GPUs, but fall back to
+    // integrated so the engine still runs on laptops without a dedicated card
+    int bestScore = 0;
     for (const auto& device : devices) {
-        if (isDeviceSuitable(device)) {
+        if (!isDeviceSuitable(device)) continue;
+
+        vk::PhysicalDeviceProperties props = device.getProperties();
+        int score = 1;
+        if (props.deviceType == vk::PhysicalDeviceType::eDiscreteGpu)        score += 1000;
+        else if (props.deviceType == vk::PhysicalDeviceType::eIntegratedGpu) score += 100;
+
+        if (score > bestScore) {
+            bestScore = score;
             physicalDevice = device;
-            break;
         }
     }
 
@@ -204,12 +210,10 @@ void Core::pickPhysicalDevice() {
     }
 
     vk::PhysicalDeviceProperties props = physicalDevice.getProperties();
-    kmrb::Log::ok("GPU selected: ");
+    kmrb::Log::ok("GPU selected: " + std::string(props.deviceName.data()));
 }
 
 bool Core::isDeviceSuitable(vk::PhysicalDevice device) {
-    vk::PhysicalDeviceProperties props = device.getProperties();
-    vk::PhysicalDeviceFeatures features = device.getFeatures();
     QueueFamilyIndices indices = findQueueFamilies(device);
 
     // Check that the GPU supports VK_KHR_swapchain
@@ -222,11 +226,7 @@ bool Core::isDeviceSuitable(vk::PhysicalDevice device) {
         swapchainAdequate = !support.formats.empty() && !support.presentModes.empty();
     }
 
-    return props.deviceType == vk::PhysicalDeviceType::eDiscreteGpu
-        && features.geometryShader
-        && indices.isComplete()
-        && extensionsSupported
-        && swapchainAdequate;
+    return indices.isComplete() && extensionsSupported && swapchainAdequate;
 }
 
 bool Core::checkDeviceExtensionSupport(vk::PhysicalDevice device) {

@@ -9,6 +9,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cmath>
+#include <bit>
+#include <array>
+#include <execution>
 #include "spirv_reflect.h"
 #include <stb_image.h>
 
@@ -32,6 +35,9 @@ void Renderer::init(GLFWwindow* window, vk::Instance instance,
     bufferManager.init(device, gpu);
     camera.init(glm::vec3(0.0f, 2.0f, 5.0f), -15.0f, -90.0f);
 
+    appStartTime = std::chrono::steady_clock::now();
+    lastFrameTime = appStartTime;
+
     createOffscreenPass(device);
     createSwapchainRenderPass(device);
     createDescriptorSetLayouts(device);
@@ -42,8 +48,12 @@ void Renderer::init(GLFWwindow* window, vk::Instance instance,
     createGlobalUBOBuffers(device);
     createDescriptorPool(device);
     createDescriptorSets(device);
-    createParticleBuffer(device);
+
+    // Command pool must exist before device-local buffers — staging copies record into it
     createCommandPool(device, graphicsQueueFamily);
+    bufferManager.setTransferContext(commandPool, graphicsQueue);
+
+    createParticleBuffer(device);
     createCommandBuffers(device);
     createSyncObjects(device);
 
@@ -51,6 +61,12 @@ void Renderer::init(GLFWwindow* window, vk::Instance instance,
     // then build the skybox rendering pipeline
     createPlaceholderCubemap(device);
     createSkyboxPipeline(device);
+
+    // IBL: create the precomputed-lighting images + bake pipelines, bake the
+    // BRDF LUT (one-time), then bake irradiance/prefiltered from the placeholder
+    // (black → zero ambient until an HDR is loaded)
+    createIBLResources(device);
+    bakeIBLMaps(device);
 
     // Load built-in mesh primitives (cube, sphere, plane) so mesh entities work immediately
     meshCache.loadPrimitives(bufferManager);
@@ -89,17 +105,24 @@ void Renderer::createOffscreenPass(vk::Device device) {
     vk::SubpassDescription subpass({}, vk::PipelineBindPoint::eGraphics,
         0, nullptr, 1, &colorRef, nullptr, &depthRef);
 
-    vk::SubpassDependency dependency(
-        VK_SUBPASS_EXTERNAL, 0,
-        vk::PipelineStageFlagBits::eColorAttachmentOutput | vk::PipelineStageFlagBits::eEarlyFragmentTests,
-        vk::PipelineStageFlagBits::eColorAttachmentOutput | vk::PipelineStageFlagBits::eEarlyFragmentTests,
-        {},
-        vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eDepthStencilAttachmentWrite
-    );
+    std::array<vk::SubpassDependency, 2> dependencies = {{
+        // Entry: wait for any previous use of the attachments before we write them
+        { VK_SUBPASS_EXTERNAL, 0,
+          vk::PipelineStageFlagBits::eColorAttachmentOutput | vk::PipelineStageFlagBits::eEarlyFragmentTests,
+          vk::PipelineStageFlagBits::eColorAttachmentOutput | vk::PipelineStageFlagBits::eEarlyFragmentTests,
+          {},
+          vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eDepthStencilAttachmentWrite },
+        // Exit: color writes must finish before ImGui samples this image as a texture
+        { 0, VK_SUBPASS_EXTERNAL,
+          vk::PipelineStageFlagBits::eColorAttachmentOutput,
+          vk::PipelineStageFlagBits::eFragmentShader,
+          vk::AccessFlagBits::eColorAttachmentWrite,
+          vk::AccessFlagBits::eShaderRead }
+    }};
 
     vk::RenderPassCreateInfo info({},
         static_cast<uint32_t>(attachments.size()), attachments.data(),
-        1, &subpass, 1, &dependency);
+        1, &subpass, static_cast<uint32_t>(dependencies.size()), dependencies.data());
 
     offscreenPass = device.createRenderPass(info);
     kmrb::Log::info("Offscreen render pass created");
@@ -144,12 +167,20 @@ void Renderer::createDescriptorSetLayouts(vk::Device device) {
     vk::DescriptorSetLayoutCreateInfo globalLayoutInfo({}, 1, &globalUBOBinding);
     descriptorSetLayouts[DESCRIPTOR_SET_GLOBAL] = device.createDescriptorSetLayout(globalLayoutInfo);
 
-    // Set 1: Environment cubemap — available to all fragment and compute shaders.
-    // User shaders sample it with: layout(set = 1, binding = 0) uniform samplerCube envMap;
-    vk::DescriptorSetLayoutBinding envBinding(
-        0, vk::DescriptorType::eCombinedImageSampler, 1,
-        vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eCompute);
-    vk::DescriptorSetLayoutCreateInfo materialLayoutInfo({}, 1, &envBinding);
+    // Set 1: Environment — available to all fragment and compute shaders.
+    //   binding 0: raw env cubemap   — layout(set=1, binding=0) uniform samplerCube envMap;
+    //   binding 1: IBL irradiance    — diffuse ambient (declared in kmrb_lighting.glsl)
+    //   binding 2: IBL prefiltered   — specular ambient, mip = roughness
+    //   binding 3: BRDF LUT          — split-sum integration table
+    auto envStages = vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eCompute;
+    std::array<vk::DescriptorSetLayoutBinding, 4> envBindings = {{
+        { 0, vk::DescriptorType::eCombinedImageSampler, 1, envStages },
+        { 1, vk::DescriptorType::eCombinedImageSampler, 1, envStages },
+        { 2, vk::DescriptorType::eCombinedImageSampler, 1, envStages },
+        { 3, vk::DescriptorType::eCombinedImageSampler, 1, envStages }
+    }};
+    vk::DescriptorSetLayoutCreateInfo materialLayoutInfo(
+        {}, static_cast<uint32_t>(envBindings.size()), envBindings.data());
     descriptorSetLayouts[DESCRIPTOR_SET_MATERIAL] = device.createDescriptorSetLayout(materialLayoutInfo);
 
     std::array<vk::DescriptorSetLayoutBinding, 2> ssboBindings = {{
@@ -255,9 +286,10 @@ void Renderer::updateGridBuffer(vk::Device device) {
     auto entity = *gridView.begin();
     auto& props = gridView.get<GridComponent>(entity);
 
+    // Clamp to the GPU buffer's capacity (sized for up to 100 cells below)
+    int n = std::clamp(props.cellCount, 1, 100);
     float half = props.size / 2.0f;
-    float step = props.size / static_cast<float>(props.cellCount);
-    int n = props.cellCount;
+    float step = props.size / static_cast<float>(n);
 
     std::vector<glm::vec3> vertices;
     vertices.reserve((n + 1) * 4);
@@ -348,48 +380,53 @@ void Renderer::appendDirArrows(std::vector<glm::vec3>& out, const glm::vec3& ori
 
 void Renderer::updateGizmoBuffer(vk::Device device) {
     gizmoDraws.clear();
-    if (!registry) return;
+    if (!registry || !ui.getShowGizmos()) return;
 
-    std::vector<glm::vec3> verts;
+    // Fixed-capacity GPU buffer — never write more vertices than fit in it
+    constexpr uint32_t maxGizmoVerts = 8 * 400;
+    constexpr vk::DeviceSize maxBuf = sizeof(glm::vec3) * maxGizmoVerts;
+    constexpr uint32_t worstCasePerLight = 160;  // Point light: sphere rings + cross ≈ 150 verts
+
+    gizmoVerts.clear();  // Member scratch — keeps its capacity across frames
     entt::entity sel = ui.getSelectedEntity();
 
     registry->view<LightComponent, Transform>().each([&](auto entity, auto& lc, auto& lt) {
-        uint32_t first = static_cast<uint32_t>(verts.size());
+        uint32_t first = static_cast<uint32_t>(gizmoVerts.size());
+        if (first + worstCasePerLight > maxGizmoVerts) return;  // Buffer full — skip extra lights
 
         float pitch = glm::radians(lt.rotation.x);
         float yaw   = glm::radians(lt.rotation.y);
         glm::vec3 dir(cosf(pitch) * sinf(yaw), -sinf(pitch), -cosf(pitch) * cosf(yaw));
 
         if (lc.type == LightType::Point) {
-            appendSphereRings(verts, lt.position, 0.3f, 24);
-            appendCross(verts, lt.position, 0.15f);
+            appendSphereRings(gizmoVerts, lt.position, 0.3f, 24);
+            appendCross(gizmoVerts, lt.position, 0.15f);
         } else if (lc.type == LightType::Spot) {
-            appendSpotCone(verts, lt.position, dir, lc.spotAngle, 2.0f, 24);
-            appendCross(verts, lt.position, 0.15f);
+            appendSpotCone(gizmoVerts, lt.position, dir, lc.spotAngle, 2.0f, 24);
+            appendCross(gizmoVerts, lt.position, 0.15f);
         } else {
             // Directional — anchor near camera so it's always visible
             glm::vec3 anchor = camera.position + camera.getForward() * 4.0f;
-            appendDirArrows(verts, anchor, dir, 1.5f);
-            appendCross(verts, anchor, 0.15f);
+            appendDirArrows(gizmoVerts, anchor, dir, 1.5f);
+            appendCross(gizmoVerts, anchor, 0.15f);
         }
 
         GizmoDrawCmd dc;
         dc.firstVertex = first;
-        dc.vertexCount = static_cast<uint32_t>(verts.size()) - first;
+        dc.vertexCount = static_cast<uint32_t>(gizmoVerts.size()) - first;
         dc.color = glm::vec4(lc.color, 1.0f);
         dc.selected = (entity == sel);
         gizmoDraws.push_back(dc);
     });
 
-    if (verts.empty()) return;
+    if (gizmoVerts.empty()) return;
 
-    constexpr vk::DeviceSize maxBuf = sizeof(glm::vec3) * 8 * 400;
     if (!bufferManager.exists("light_gizmos")) {
         bufferManager.createBuffer("light_gizmos", maxBuf,
             vk::BufferUsageFlagBits::eVertexBuffer,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
     }
-    bufferManager.upload("light_gizmos", verts.data(), sizeof(glm::vec3) * verts.size());
+    bufferManager.upload("light_gizmos", gizmoVerts.data(), sizeof(glm::vec3) * gizmoVerts.size());
 }
 
 void Renderer::drawLightGizmos(vk::CommandBuffer cmd, uint32_t imageIndex) {
@@ -526,7 +563,8 @@ void Renderer::createDescriptorPool(vk::Device device) {
     std::vector<vk::DescriptorPoolSize> poolSizes = {
         { vk::DescriptorType::eUniformBuffer, imageCount },
         { vk::DescriptorType::eStorageBuffer, 8 },
-        { vk::DescriptorType::eCombinedImageSampler, imageCount * 8 }
+        { vk::DescriptorType::eCombinedImageSampler, imageCount * 8 },
+        { vk::DescriptorType::eStorageImage, 8 }  // transient IBL bake targets
     };
 
     vk::DescriptorPoolCreateInfo poolInfo(
@@ -569,10 +607,12 @@ void Renderer::createParticleBuffer(vk::Device device) {
     vk::DeviceSize bufferSize = sizeof(Particle) * particleCount;
     const char* names[] = { "particle_a", "particle_b" };
 
+    // Device-local: compute reads/writes these every frame — keep them in VRAM,
+    // not host memory that the GPU would have to reach over PCIe
     for (int i = 0; i < 2; i++) {
         bufferManager.createBuffer(names[i], bufferSize,
             vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eVertexBuffer,
-            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+            vk::MemoryPropertyFlagBits::eDeviceLocal);
         bufferManager.setElementInfo(names[i], particleCount, sizeof(Particle));
     }
 
@@ -634,9 +674,8 @@ void Renderer::createSyncObjects(vk::Device device) {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 void Renderer::updateGlobalUBO(uint32_t imageIndex) {
-    static auto startTime = std::chrono::high_resolution_clock::now();
-    auto currentTime = std::chrono::high_resolution_clock::now();
-    float time = std::chrono::duration<float>(currentTime - startTime).count();
+    float time = std::chrono::duration<float>(
+        std::chrono::steady_clock::now() - appStartTime).count();
 
     // Read FOV/near/far from the active camera entity, fall back to defaults
     float fov = 45.0f;
@@ -725,15 +764,16 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
             vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eCompute,
             0, sizeof(PushConstants), &push);
 
-        cmd.dispatch((particleCount + 255) / 256, 1, 1);
+        cmd.dispatch((particleCount + activeInstance->initLocalSizeX - 1) / activeInstance->initLocalSizeX, 1, 1);
 
-        // Barrier: init write → vertex read (rendering the init result this frame)
+        // Barrier: init write → vertex read (this frame) AND compute read (next frame's dispatch)
         vk::Buffer outputBuffer = bufferManager.getBuffer(pingPong == 0 ? "particle_b" : "particle_a");
         vk::BufferMemoryBarrier barrier(
             vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eShaderRead,
             VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, outputBuffer, 0, VK_WHOLE_SIZE);
         cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-            vk::PipelineStageFlagBits::eVertexShader, {}, nullptr, barrier, nullptr);
+            vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eComputeShader,
+            {}, nullptr, barrier, nullptr);
 
         activeInstance->initPending = false;
         initRanThisFrame = true;
@@ -766,14 +806,16 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
                 0, sizeof(PushConstants), &push);
         }
 
-        cmd.dispatch((particleCount + 255) / 256, 1, 1);
+        cmd.dispatch((particleCount + activeInstance->computeLocalSizeX - 1) / activeInstance->computeLocalSizeX, 1, 1);
 
+        // Barrier: compute write → vertex read (this frame) AND compute read (next frame's dispatch)
         vk::Buffer outputBuffer = bufferManager.getBuffer(pingPong == 0 ? "particle_b" : "particle_a");
         vk::BufferMemoryBarrier barrier(
             vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eShaderRead,
             VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, outputBuffer, 0, VK_WHOLE_SIZE);
         cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-            vk::PipelineStageFlagBits::eVertexShader, {}, nullptr, barrier, nullptr);
+            vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eComputeShader,
+            {}, nullptr, barrier, nullptr);
     }
 
     // ── OFFSCREEN PASS ──
@@ -894,7 +936,8 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
     if (gridVertexCount > 0 && bufferManager.exists("grid_lines") && registry) {
         cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, gridPipeline);
         cmd.setViewport(0, viewport);
-        cmd.setScissor(0, vk::Rect2D({0,0}, extent));
+        // Scissor must stay inside the offscreen framebuffer (renderExtent, not window extent)
+        cmd.setScissor(0, vk::Rect2D({0,0}, renderExtent));
 
         cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout,
             DESCRIPTOR_SET_GLOBAL, globalDescriptorSets[imageIndex], nullptr);
@@ -915,10 +958,10 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
             cmd.draw(gridVertexCount, 1, 0, 0);
             gridRendered = true;
         });
-
-        // ── LIGHT GIZMOS ──
-        drawLightGizmos(cmd, imageIndex);
     }
+
+    // ── LIGHT GIZMOS (independent of the grid — visible even with no grid entity) ──
+    drawLightGizmos(cmd, imageIndex);
 
     cmd.endRenderPass();
 
@@ -947,19 +990,24 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
 bool Renderer::drawFrame(vk::Device device, vk::SwapchainKHR swapchain,
                          vk::Queue graphicsQueue, vk::Queue presentQueue,
                          GLFWwindow* window) {
-    static uint32_t frameCounter = 0;
-    if (++frameCounter >= 30) {
-        frameCounter = 0;
+    // Real frame delta — used for camera movement so fly speed doesn't depend on FPS
+    auto now = std::chrono::steady_clock::now();
+    float frameDt = std::chrono::duration<float>(now - lastFrameTime).count();
+    lastFrameTime = now;
+    frameDt = std::min(frameDt, 0.1f);  // Clamp gaps from window drags / debugger pauses
+
+    // Poll shader files for hot-reload every 30 frames (not every frame)
+    if (++hotReloadCounter >= 30) {
+        hotReloadCounter = 0;
         syncShaderInstances(device);
         syncMeshInstances(device);
         updateGridBuffer(device);
     }
-    static bool initialized = false;
-    if (!initialized && registry) {
+    if (!firstSyncDone && registry) {
         syncShaderInstances(device);
         syncMeshInstances(device);
         updateGridBuffer(device);
-        initialized = true;
+        firstSyncDone = true;
     }
     updateGizmoBuffer(device);
 
@@ -970,6 +1018,9 @@ bool Renderer::drawFrame(vk::Device device, vk::SwapchainKHR swapchain,
     // Resolution change — recreate offscreen framebuffer at new size
     if (ui.isRenderResolutionDirty()) {
         device.waitIdle();
+        // Release the old ImGui binding first — AddTexture without RemoveTexture
+        // leaks a descriptor set on every resolution change
+        ImGui_ImplVulkan_RemoveTexture(offscreenImGuiDescriptor);
         cleanupOffscreenResources(device);
         renderExtent = vk::Extent2D(ui.getRenderWidth(), ui.getRenderHeight());
         createOffscreenResources(device);
@@ -989,7 +1040,7 @@ bool Renderer::drawFrame(vk::Device device, vk::SwapchainKHR swapchain,
         for (int i = 0; i < 2; i++) {
             bufferManager.createBuffer(names[i], bufferSize,
                 vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eVertexBuffer,
-                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+                vk::MemoryPropertyFlagBits::eDeviceLocal);
             bufferManager.setElementInfo(names[i], newCount, sizeof(Particle));
         }
         // Re-bind descriptor sets for new buffers
@@ -1010,7 +1061,7 @@ bool Renderer::drawFrame(vk::Device device, vk::SwapchainKHR swapchain,
 
     // Camera — two-way sync with active camera entity
     camera.viewportHovered = ui.isViewportHovered();
-    camera.update(window, 0.016f); // Fixed dt for input (actual physics dt is in UBO)
+    camera.update(window, frameDt);
 
     if (registry) {
         bool camFound = false;
@@ -1084,110 +1135,136 @@ bool Renderer::drawFrame(vk::Device device, vk::SwapchainKHR swapchain,
 // SWAPCHAIN RECREATION
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+// Destroy only extent-dependent resources — pools, UBOs, descriptor sets,
+// command buffers, and sync objects don't depend on the window size
 void Renderer::cleanupSwapchainResources(vk::Device device) {
-    for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
-        device.destroySemaphore(acquireSemaphores[i]);
-        device.destroyFence(inFlightFences[i]);
-    }
-    for (uint32_t i = 0; i < imageCount; i++)
-        device.destroySemaphore(renderFinishedSemaphores[i]);
-
-    device.destroyCommandPool(commandPool);
     for (auto& fb : swapchainFramebuffers)
         device.destroyFramebuffer(fb);
+    swapchainFramebuffers.clear();
 
     cleanupOffscreenResources(device);
-
-    for (uint32_t i = 0; i < imageCount; i++)
-        bufferManager.destroyBuffer("global_ubo_" + std::to_string(i));
-
-    device.destroyDescriptorPool(descriptorPool);
-    envDescriptorSet = nullptr;  // Freed with the pool — must be reallocated
 }
 
 void Renderer::onSwapchainRecreate(vk::Device device, vk::Extent2D newExtent,
                                    const std::vector<vk::ImageView>& newImageViews) {
-    cleanupSwapchainResources(device);
+    uint32_t newImageCount = static_cast<uint32_t>(newImageViews.size());
 
-    extent = newExtent;
-    imageCount = static_cast<uint32_t>(newImageViews.size());
-    currentFrame = 0;
-    pingPong = 0;
+    // Release the old viewport texture binding (avoids an ImGui descriptor leak)
+    ImGui_ImplVulkan_RemoveTexture(offscreenImGuiDescriptor);
 
-    createOffscreenResources(device);
-    createSwapchainFramebuffers(device, newImageViews);
-    createGlobalUBOBuffers(device);
-    createDescriptorPool(device);
-    createDescriptorSets(device);
+    if (newImageCount == imageCount) {
+        // Fast path (normal resize): only the framebuffers and offscreen images
+        // depend on the extent. Everything else survives.
+        cleanupSwapchainResources(device);
+        extent = newExtent;
+        createOffscreenResources(device);
+        createSwapchainFramebuffers(device, newImageViews);
+        imagesInFlight.assign(imageCount, nullptr);
+    } else {
+        // Rare path: image count changed — per-image resources must be rebuilt too
+        for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            device.destroySemaphore(acquireSemaphores[i]);
+            device.destroyFence(inFlightFences[i]);
+        }
+        for (uint32_t i = 0; i < imageCount; i++)
+            device.destroySemaphore(renderFinishedSemaphores[i]);
 
-    // Re-allocate env map descriptor set (old one was freed with the pool)
-    if (envCubemapView && envSampler) {
-        vk::DescriptorSetAllocateInfo envAllocInfo(descriptorPool, 1,
-            &descriptorSetLayouts[DESCRIPTOR_SET_MATERIAL]);
-        envDescriptorSet = device.allocateDescriptorSets(envAllocInfo)[0];
-        vk::DescriptorImageInfo imgInfo(envSampler, envCubemapView,
-            vk::ImageLayout::eShaderReadOnlyOptimal);
-        vk::WriteDescriptorSet write(envDescriptorSet, 0, 0, 1,
-            vk::DescriptorType::eCombinedImageSampler, &imgInfo);
-        device.updateDescriptorSets(write, nullptr);
+        device.destroyCommandPool(commandPool);
+        cleanupSwapchainResources(device);
+
+        for (uint32_t i = 0; i < imageCount; i++)
+            bufferManager.destroyBuffer("global_ubo_" + std::to_string(i));
+
+        device.destroyDescriptorPool(descriptorPool);
+        envDescriptorSet = nullptr;  // Freed with the pool — must be reallocated
+
+        extent = newExtent;
+        imageCount = newImageCount;
+        currentFrame = 0;
+
+        createOffscreenResources(device);
+        createSwapchainFramebuffers(device, newImageViews);
+        createGlobalUBOBuffers(device);
+        createDescriptorPool(device);
+        createDescriptorSets(device);
+
+        // Re-allocate env map descriptor set (old one was freed with the pool)
+        if (envCubemapView && envSampler) {
+            vk::DescriptorSetAllocateInfo envAllocInfo(descriptorPool, 1,
+                &descriptorSetLayouts[DESCRIPTOR_SET_MATERIAL]);
+            envDescriptorSet = device.allocateDescriptorSets(envAllocInfo)[0];
+            vk::DescriptorImageInfo imgInfo(envSampler, envCubemapView,
+                vk::ImageLayout::eShaderReadOnlyOptimal);
+            vk::WriteDescriptorSet write(envDescriptorSet, 0, 0, 1,
+                vk::DescriptorType::eCombinedImageSampler, &imgInfo);
+            device.updateDescriptorSets(write, nullptr);
+            // IBL maps survive the pool reset (images are intact) — re-point bindings 1-3
+            writeIBLDescriptors(device);
+        }
+
+        // Re-wire particle buffers to new descriptor sets
+        vk::DeviceSize bufferSize = sizeof(Particle) * particleCount;
+        const char* names[] = { "particle_a", "particle_b" };
+        for (int i = 0; i < 2; i++) {
+            vk::DescriptorBufferInfo inputInfo(bufferManager.getBuffer(names[i]), 0, bufferSize);
+            vk::DescriptorBufferInfo outputInfo(bufferManager.getBuffer(names[1 - i]), 0, bufferSize);
+            std::array<vk::WriteDescriptorSet, 2> writes = {{
+                { particleDescriptorSets[i], 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &inputInfo },
+                { particleDescriptorSets[i], 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &outputInfo }
+            }};
+            device.updateDescriptorSets(writes, nullptr);
+        }
+
+        createCommandPool(device, graphicsQueueFamily);
+        // The old command pool handle is stale — re-point staging copies at the new one
+        bufferManager.setTransferContext(commandPool, device.getQueue(graphicsQueueFamily, 0));
+        createCommandBuffers(device);
+        createSyncObjects(device);
+
+        ui.onSwapchainRecreate(imageCount);
     }
 
-    // Re-wire particle buffers to new descriptor sets
-    vk::DeviceSize bufferSize = sizeof(Particle) * particleCount;
-    const char* names[] = { "particle_a", "particle_b" };
-    for (int i = 0; i < 2; i++) {
-        vk::DescriptorBufferInfo inputInfo(bufferManager.getBuffer(names[i]), 0, bufferSize);
-        vk::DescriptorBufferInfo outputInfo(bufferManager.getBuffer(names[1 - i]), 0, bufferSize);
-        std::array<vk::WriteDescriptorSet, 2> writes = {{
-            { particleDescriptorSets[i], 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &inputInfo },
-            { particleDescriptorSets[i], 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &outputInfo }
-        }};
-        device.updateDescriptorSets(writes, nullptr);
-    }
-
-    createCommandPool(device, graphicsQueueFamily);
-    createCommandBuffers(device);
-    createSyncObjects(device);
-
-    ui.onSwapchainRecreate(imageCount);
-
-    // Recreate ImGui texture for new offscreen image
+    // Re-bind the offscreen image as an ImGui texture
     offscreenImGuiDescriptor = ImGui_ImplVulkan_AddTexture(
         offscreenSampler, offscreenColorView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
-    kmrb::Log::info("Renderer recreated for ");
+    kmrb::Log::info("Swapchain resources recreated ("
+                    + std::to_string(extent.width) + "x" + std::to_string(extent.height) + ")");
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // SHADER INSTANCE MANAGEMENT
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-vk::Pipeline Renderer::buildComputePipeline(vk::Device device, const std::string& path) {
-    auto spirv = compileGLSL(path);
-    if (spirv.empty()) {
-        Log::error("Failed to compile: " + path);
-        return nullptr;
+// Read local_size_x from compiled SPIR-V so dispatch counts always match the
+// workgroup size the user declared in their GLSL (falls back to 256)
+static uint32_t reflectWorkgroupSizeX(const std::vector<uint32_t>& spirv) {
+    SpvReflectShaderModule module;
+    if (spvReflectCreateShaderModule(spirv.size() * sizeof(uint32_t), spirv.data(), &module)
+        != SPV_REFLECT_RESULT_SUCCESS) {
+        return 256;
     }
+    uint32_t sizeX = 256;
+    if (module.entry_point_count > 0 && module.entry_points[0].local_size.x > 0) {
+        sizeX = module.entry_points[0].local_size.x;
+    }
+    spvReflectDestroyShaderModule(&module);
+    return sizeX;
+}
+
+vk::Pipeline Renderer::buildComputePipeline(vk::Device device, const std::vector<uint32_t>& spirv) {
     vk::ShaderModuleCreateInfo moduleInfo({}, spirv.size() * sizeof(uint32_t), spirv.data());
     vk::ShaderModule compModule = device.createShaderModule(moduleInfo);
     vk::PipelineShaderStageCreateInfo stageInfo({}, vk::ShaderStageFlagBits::eCompute, compModule, "main");
     auto result = device.createComputePipeline(nullptr,
         vk::ComputePipelineCreateInfo({}, stageInfo, pipelineLayout));
     device.destroyShaderModule(compModule);
-    Log::ok("Compiled compute: " + std::filesystem::path(path).filename().string());
     return result.value;
 }
 
 vk::Pipeline Renderer::buildGraphicsPipeline(vk::Device device,
-                                              const std::string& vertPath,
-                                              const std::string& fragPath) {
-    auto vertSpirv = compileGLSL(vertPath);
-    auto fragSpirv = compileGLSL(fragPath);
-    if (vertSpirv.empty() || fragSpirv.empty()) {
-        Log::error("Failed to compile graphics shaders");
-        return nullptr;
-    }
-
+                                              const std::vector<uint32_t>& vertSpirv,
+                                              const std::vector<uint32_t>& fragSpirv) {
     vk::ShaderModule vertModule = device.createShaderModule(
         vk::ShaderModuleCreateInfo({}, vertSpirv.size() * sizeof(uint32_t), vertSpirv.data()));
     vk::ShaderModule fragModule = device.createShaderModule(
@@ -1229,8 +1306,6 @@ vk::Pipeline Renderer::buildGraphicsPipeline(vk::Device device,
     auto result = device.createGraphicsPipeline(nullptr, pipelineInfo);
     device.destroyShaderModule(vertModule);
     device.destroyShaderModule(fragModule);
-    Log::ok("Compiled graphics: " + std::filesystem::path(vertPath).filename().string()
-            + " + " + std::filesystem::path(fragPath).filename().string());
     return result.value;
 }
 
@@ -1245,16 +1320,9 @@ void Renderer::destroyShaderInstance(vk::Device device, ShaderInstance& inst) {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 vk::Pipeline Renderer::buildMeshGraphicsPipeline(vk::Device device,
-                                                 const std::string& vertPath,
-                                                 const std::string& fragPath,
+                                                 const std::vector<uint32_t>& vertSpirv,
+                                                 const std::vector<uint32_t>& fragSpirv,
                                                  bool wireframe) {
-    auto vertSpirv = compileGLSL(vertPath);
-    auto fragSpirv = compileGLSL(fragPath);
-    if (vertSpirv.empty() || fragSpirv.empty()) {
-        Log::error("Failed to compile mesh shaders");
-        return nullptr;
-    }
-
     vk::ShaderModule vertModule = device.createShaderModule(
         vk::ShaderModuleCreateInfo({}, vertSpirv.size() * sizeof(uint32_t), vertSpirv.data()));
     vk::ShaderModule fragModule = device.createShaderModule(
@@ -1303,8 +1371,6 @@ vk::Pipeline Renderer::buildMeshGraphicsPipeline(vk::Device device,
     auto result = device.createGraphicsPipeline(nullptr, pipelineInfo);
     device.destroyShaderModule(vertModule);
     device.destroyShaderModule(fragModule);
-    Log::ok("Compiled mesh: " + std::filesystem::path(vertPath).filename().string()
-            + " + " + std::filesystem::path(fragPath).filename().string());
     return result.value;
 }
 
@@ -1315,6 +1381,9 @@ void Renderer::destroyMeshInstance(vk::Device device, MeshShaderInstance& inst) 
 void Renderer::syncMeshInstances(vk::Device device) {
     if (!registry) return;
     namespace fs = std::filesystem;
+
+    // waitIdle once per sync pass (before the first rebuild), not once per mesh
+    bool waitedIdle = false;
 
     auto view = registry->view<MeshRendererComponent>();
     for (auto entity : view) {
@@ -1367,7 +1436,8 @@ void Renderer::syncMeshInstances(vk::Device device) {
 
         if (!mesh.shaderDirty) continue;
 
-        device.waitIdle();
+        // Pipelines may still be in use by in-flight frames — wait before destroying
+        if (!waitedIdle) { device.waitIdle(); waitedIdle = true; }
 
         if (it != meshInstances.end()) {
             destroyMeshInstance(device, it->second);
@@ -1390,21 +1460,25 @@ void Renderer::syncMeshInstances(vk::Device device) {
         inst.fragmentPath = fragPath;
 
         if (fs::exists(vertPath) && fs::exists(fragPath)) {
-            // Reflect push constants from the fragment shader (more likely to have user params)
-            auto spirv = compileGLSL(fragPath);
-            if (!spirv.empty()) {
-                // Reuse the same reflection logic — MeshShaderInstance has the same fields
+            // Compile each stage once — the frag SPIR-V is reused for reflection
+            auto vertSpirv = compileGLSL(vertPath);
+            auto fragSpirv = compileGLSL(fragPath);
+
+            if (!vertSpirv.empty() && !fragSpirv.empty()) {
+                // Reflect push constants from the fragment shader (more likely to have user params).
+                // Reuse the ShaderInstance reflection logic — MeshShaderInstance has the same fields.
                 ShaderInstance tempReflect;
-                tempReflect.pushConstantSize = inst.pushConstantSize;
-                tempReflect.pushConstantData = inst.pushConstantData;
-                tempReflect.reflectedParams = inst.reflectedParams;
-                reflectPushConstants(spirv, tempReflect);
+                reflectPushConstants(fragSpirv, tempReflect);
                 inst.pushConstantSize = tempReflect.pushConstantSize;
                 inst.pushConstantData = std::move(tempReflect.pushConstantData);
                 inst.reflectedParams = std::move(tempReflect.reflectedParams);
-            }
 
-            inst.graphicsPipeline = buildMeshGraphicsPipeline(device, vertPath, fragPath, mesh.wireframe);
+                inst.graphicsPipeline = buildMeshGraphicsPipeline(device, vertSpirv, fragSpirv, mesh.wireframe);
+                Log::ok("Compiled mesh: " + fs::path(vertPath).filename().string()
+                        + " + " + fs::path(fragPath).filename().string());
+            } else {
+                Log::error("Failed to compile mesh shaders");
+            }
             inst.vertModTime = fs::last_write_time(vertPath);
             inst.fragModTime = fs::last_write_time(fragPath);
         }
@@ -1417,7 +1491,7 @@ void Renderer::syncMeshInstances(vk::Device device) {
     std::vector<uint32_t> toRemove;
     for (auto& [key, inst] : meshInstances) {
         if (!registry->valid(inst.owner)) {
-            device.waitIdle();
+            if (!waitedIdle) { device.waitIdle(); waitedIdle = true; }
             destroyMeshInstance(device, inst);
             toRemove.push_back(key);
         }
@@ -1560,6 +1634,9 @@ void Renderer::syncShaderInstances(vk::Device device) {
     if (!registry) return;
     namespace fs = std::filesystem;
 
+    // waitIdle once per sync pass (before the first rebuild), not once per shader
+    bool waitedIdle = false;
+
     auto view = registry->view<ShaderProgramComponent>();
     for (auto entity : view) {
         auto& shader = view.get<ShaderProgramComponent>(entity);
@@ -1587,7 +1664,8 @@ void Renderer::syncShaderInstances(vk::Device device) {
 
         if (!shader.dirty) continue;
 
-        device.waitIdle();
+        // Pipelines may still be in use by in-flight frames — wait before destroying
+        if (!waitedIdle) { device.waitIdle(); waitedIdle = true; }
 
         if (it != shaderInstances.end()) {
             destroyShaderInstance(device, it->second);
@@ -1600,35 +1678,51 @@ void Renderer::syncShaderInstances(vk::Device device) {
         inst.vertexPath = shader.vertexPath;
         inst.fragmentPath = shader.fragmentPath;
 
+        // Each shader is compiled to SPIR-V once; the same binary feeds the
+        // pipeline, push constant reflection, and workgroup size reflection.
+        // Push constants: all stages share one layout (Vulkan requires this),
+        // so reflecting compute (or vertex as fallback) once is enough.
+        bool reflected = false;
+
         // Build init pipeline (one-shot compute shader for particle setup)
         if (!shader.initPath.empty() && fs::exists(shader.initPath)) {
-            inst.initPipeline = buildComputePipeline(device, shader.initPath);
+            auto spirv = compileGLSL(shader.initPath);
+            if (!spirv.empty()) {
+                inst.initPipeline = buildComputePipeline(device, spirv);
+                inst.initLocalSizeX = reflectWorkgroupSizeX(spirv);
+                Log::ok("Compiled init: " + fs::path(shader.initPath).filename().string());
+            } else {
+                Log::error("Failed to compile: " + shader.initPath);
+            }
             inst.initModTime = fs::last_write_time(shader.initPath);
             inst.initPending = true;  // Dispatch once on next frame
         }
-
-        // Compile shaders and reflect push constants from the first available stage.
-        // SPIRV-Reflect reads the compiled SPIR-V to discover user-defined params.
-        // We reflect compute if present, otherwise vertex — all stages share the same
-        // push constant layout (Vulkan requires this), so one reflection is enough.
-        bool reflected = false;
 
         if (!shader.computePath.empty() && fs::exists(shader.computePath)) {
             auto spirv = compileGLSL(shader.computePath);
             if (!spirv.empty()) {
                 if (!reflected) { reflectPushConstants(spirv, inst); reflected = true; }
+                inst.computePipeline = buildComputePipeline(device, spirv);
+                inst.computeLocalSizeX = reflectWorkgroupSizeX(spirv);
+                Log::ok("Compiled compute: " + fs::path(shader.computePath).filename().string());
+            } else {
+                Log::error("Failed to compile: " + shader.computePath);
             }
-            inst.computePipeline = buildComputePipeline(device, shader.computePath);
             inst.compModTime = fs::last_write_time(shader.computePath);
         }
 
         if (!shader.vertexPath.empty() && !shader.fragmentPath.empty() &&
             fs::exists(shader.vertexPath) && fs::exists(shader.fragmentPath)) {
-            if (!reflected) {
-                auto spirv = compileGLSL(shader.vertexPath);
-                if (!spirv.empty()) { reflectPushConstants(spirv, inst); reflected = true; }
+            auto vertSpirv = compileGLSL(shader.vertexPath);
+            auto fragSpirv = compileGLSL(shader.fragmentPath);
+            if (!vertSpirv.empty() && !fragSpirv.empty()) {
+                if (!reflected) { reflectPushConstants(vertSpirv, inst); reflected = true; }
+                inst.graphicsPipeline = buildGraphicsPipeline(device, vertSpirv, fragSpirv);
+                Log::ok("Compiled graphics: " + fs::path(shader.vertexPath).filename().string()
+                        + " + " + fs::path(shader.fragmentPath).filename().string());
+            } else {
+                Log::error("Failed to compile graphics shaders");
             }
-            inst.graphicsPipeline = buildGraphicsPipeline(device, shader.vertexPath, shader.fragmentPath);
             inst.vertModTime = fs::last_write_time(shader.vertexPath);
             inst.fragModTime = fs::last_write_time(shader.fragmentPath);
         }
@@ -1641,7 +1735,7 @@ void Renderer::syncShaderInstances(vk::Device device) {
     std::vector<uint32_t> toRemove;
     for (auto& [key, inst] : shaderInstances) {
         if (!registry->valid(inst.owner)) {
-            device.waitIdle();
+            if (!waitedIdle) { device.waitIdle(); waitedIdle = true; }
             destroyShaderInstance(device, inst);
             toRemove.push_back(key);
         }
@@ -1829,10 +1923,13 @@ void Renderer::createPlaceholderCubemap(vk::Device device) {
         envCubemap, envCubemapMemory, envCubemapView, envSampler,
         commandPool, queue);
 
-    // Allocate and write descriptor set for Set 1
-    vk::DescriptorSetAllocateInfo allocInfo(descriptorPool, 1,
-        &descriptorSetLayouts[DESCRIPTOR_SET_MATERIAL]);
-    envDescriptorSet = device.allocateDescriptorSets(allocInfo)[0];
+    // Allocate the Set 1 descriptor set on first call only — on env-map clear
+    // this function runs again and must reuse the existing set, not leak a new one
+    if (!envDescriptorSet) {
+        vk::DescriptorSetAllocateInfo allocInfo(descriptorPool, 1,
+            &descriptorSetLayouts[DESCRIPTOR_SET_MATERIAL]);
+        envDescriptorSet = device.allocateDescriptorSets(allocInfo)[0];
+    }
 
     vk::DescriptorImageInfo imgInfo(envSampler, envCubemapView,
         vk::ImageLayout::eShaderReadOnlyOptimal);
@@ -1853,8 +1950,10 @@ void Renderer::destroyEnvironmentMap(vk::Device device) {
 
     envMapLoaded = false;
 
-    // Recreate the placeholder so Set 1 is always valid
+    // Recreate the placeholder so Set 1 is always valid, then re-bake the IBL
+    // maps from it — black source convolves to black, killing the ambient light
     createPlaceholderCubemap(device);
+    bakeIBLMaps(device);
     Log::info("Environment map cleared");
 }
 
@@ -1889,7 +1988,7 @@ void Renderer::loadEnvironmentMap(vk::Device device, const std::string& hdrPath)
 
     // Half-float conversion helper (IEEE 754 binary16)
     auto floatToHalf = [](float f) -> uint16_t {
-        uint32_t bits = *reinterpret_cast<uint32_t*>(&f);
+        uint32_t bits = std::bit_cast<uint32_t>(f);  // Type-pun safely (no aliasing UB)
         uint32_t sign = (bits >> 16) & 0x8000;
         int32_t exp = ((bits >> 23) & 0xFF) - 127 + 15;
         uint32_t mant = bits & 0x7FFFFF;
@@ -1901,7 +2000,9 @@ void Renderer::loadEnvironmentMap(vk::Device device, const std::string& hdrPath)
     // Direction vectors for each cubemap face.
     // For face (u,v) in [0,1]², these define the 3D direction to sample.
     // face 0: +X, face 1: -X, face 2: +Y, face 3: -Y, face 4: +Z, face 5: -Z
-    for (uint32_t face = 0; face < 6; face++) {
+    // Each face writes a disjoint range of cubemapData → safe to convert in parallel.
+    std::array<uint32_t, 6> faces = { 0, 1, 2, 3, 4, 5 };
+    std::for_each(std::execution::par, faces.begin(), faces.end(), [&](uint32_t face) {
         for (uint32_t y = 0; y < faceSize; y++) {
             for (uint32_t x = 0; x < faceSize; x++) {
                 // Map pixel to [-1, 1] range
@@ -1930,7 +2031,7 @@ void Renderer::loadEnvironmentMap(vk::Device device, const std::string& hdrPath)
                 float eqU = (theta / (2.0f * 3.14159265f)) + 0.5f;   // 0 to 1
                 float eqV = (phi / 3.14159265f) + 0.5f;              // 0 to 1
 
-                // Sample equirectangular image (bilinear)
+                // Sample equirectangular image (nearest neighbor)
                 float sx = eqU * (width - 1);
                 float sy = (1.0f - eqV) * (height - 1);  // Flip V
                 int ix = std::clamp(static_cast<int>(sx), 0, width - 1);
@@ -1945,7 +2046,7 @@ void Renderer::loadEnvironmentMap(vk::Device device, const std::string& hdrPath)
                 cubemapData[dstIdx + 3] = floatToHalf(1.0f);
             }
         }
-    }
+    });
 
     stbi_image_free(hdrData);
 
@@ -1964,10 +2065,13 @@ void Renderer::loadEnvironmentMap(vk::Device device, const std::string& hdrPath)
         vk::DescriptorType::eCombinedImageSampler, &imgInfo);
     device.updateDescriptorSets(write, nullptr);
 
+    // Re-convolve the IBL maps from the new environment so lighting matches the sky
+    bakeIBLMaps(device);
+
     envMapLoaded = true;
     namespace fs = std::filesystem;
     Log::ok("Environment map loaded: " + fs::path(hdrPath).filename().string()
-            + " (" + std::to_string(faceSize) + "x" + std::to_string(faceSize) + " per face)");
+            + " (" + std::to_string(faceSize) + "x" + std::to_string(faceSize) + " per face, IBL baked)");
 }
 
 void Renderer::createSkyboxPipeline(vk::Device device) {
@@ -2026,6 +2130,296 @@ void Renderer::createSkyboxPipeline(vk::Device device) {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// IBL — IMAGE-BASED LIGHTING (split-sum precompute)
+//
+// The PBR shaders need three precomputed textures to light meshes from the
+// environment map (see kmrb_lighting.glsl / kmrb_ibl):
+//   irradiance  (32³ cube)        — cosine-convolved env  → diffuse ambient
+//   prefiltered (128³ cube, mips) — GGX-convolved env     → specular ambient
+//   BRDF LUT    (512² 2D)         — split-sum table, env-independent
+//
+// The images are fixed-size and live for the whole session; only their
+// *contents* are re-baked (compute dispatch) when the HDR changes. The bake
+// shaders write via storage-image views, which the main pipeline layout has
+// no bindings for — hence the dedicated iblBake* layout/pipelines.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+void Renderer::createIBLResources(vk::Device device) {
+    auto findMem = [&](vk::MemoryRequirements reqs) -> uint32_t {
+        auto memProps = physicalDevice.getMemoryProperties();
+        for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+            if ((reqs.memoryTypeBits & (1 << i)) &&
+                (memProps.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal))
+                return i;
+        }
+        throw std::runtime_error("No device-local memory type for IBL images");
+    };
+
+    // RGBA16F everywhere: HDR range, and one of the few formats Vulkan
+    // guarantees storage-image support for (compute shaders write these directly)
+    const auto format = vk::Format::eR16G16B16A16Sfloat;
+    const auto usage  = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage;
+
+    auto makeImage = [&](uint32_t size, uint32_t mips, uint32_t layers, bool cube,
+                         vk::Image& img, vk::DeviceMemory& mem) {
+        vk::ImageCreateInfo info(
+            cube ? vk::ImageCreateFlagBits::eCubeCompatible : vk::ImageCreateFlags{},
+            vk::ImageType::e2D, format, vk::Extent3D(size, size, 1),
+            mips, layers, vk::SampleCountFlagBits::e1, vk::ImageTiling::eOptimal,
+            usage, vk::SharingMode::eExclusive);
+        img = device.createImage(info);
+        auto reqs = device.getImageMemoryRequirements(img);
+        mem = device.allocateMemory(vk::MemoryAllocateInfo(reqs.size, findMem(reqs)));
+        device.bindImageMemory(img, mem, 0);
+    };
+
+    // Samplers: clamp-to-edge, linear. The prefiltered sampler must allow all
+    // mip levels — vk::SamplerCreateInfo defaults maxLod to 0, which would
+    // silently clamp every textureLod() to the sharpest mip.
+    auto makeSampler = [&](float maxLod) {
+        vk::SamplerCreateInfo info({},
+            vk::Filter::eLinear, vk::Filter::eLinear, vk::SamplerMipmapMode::eLinear,
+            vk::SamplerAddressMode::eClampToEdge, vk::SamplerAddressMode::eClampToEdge,
+            vk::SamplerAddressMode::eClampToEdge);
+        info.maxLod = maxLod;
+        return device.createSampler(info);
+    };
+
+    // ── Irradiance cubemap (Set 1, binding 1) ──
+    makeImage(IBL_IRRADIANCE_SIZE, 1, 6, true, iblIrradiance, iblIrradianceMemory);
+    iblIrradianceView = device.createImageView(vk::ImageViewCreateInfo(
+        {}, iblIrradiance, vk::ImageViewType::eCube, format, {},
+        vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 6)));
+    // Compute shaders can't write through a cube view portably — they write the
+    // same 6 layers through a 2D-array view instead (image2DArray in GLSL)
+    iblIrradianceStorageView = device.createImageView(vk::ImageViewCreateInfo(
+        {}, iblIrradiance, vk::ImageViewType::e2DArray, format, {},
+        vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 6)));
+    iblIrradianceSampler = makeSampler(0.0f);
+
+    // ── Prefiltered specular cubemap (Set 1, binding 2) ──
+    makeImage(IBL_PREFILTERED_SIZE, IBL_PREFILTER_MIPS, 6, true,
+              iblPrefiltered, iblPrefilteredMemory);
+    iblPrefilteredView = device.createImageView(vk::ImageViewCreateInfo(
+        {}, iblPrefiltered, vk::ImageViewType::eCube, format, {},
+        vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, IBL_PREFILTER_MIPS, 0, 6)));
+    for (uint32_t mip = 0; mip < IBL_PREFILTER_MIPS; mip++) {
+        // One write-target view per mip — each mip is a separate bake dispatch
+        iblPrefilteredMipViews[mip] = device.createImageView(vk::ImageViewCreateInfo(
+            {}, iblPrefiltered, vk::ImageViewType::e2DArray, format, {},
+            vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, mip, 1, 0, 6)));
+    }
+    iblPrefilteredSampler = makeSampler(VK_LOD_CLAMP_NONE);
+
+    // ── BRDF LUT (Set 1, binding 3) ──
+    makeImage(IBL_BRDF_LUT_SIZE, 1, 1, false, iblBrdfLut, iblBrdfLutMemory);
+    iblBrdfLutView = device.createImageView(vk::ImageViewCreateInfo(
+        {}, iblBrdfLut, vk::ImageViewType::e2D, format, {},
+        vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1)));
+    iblBrdfLutSampler = makeSampler(0.0f);
+
+    // ── Bake descriptor/pipeline layout: src env (sampled) + dst (storage) ──
+    std::array<vk::DescriptorSetLayoutBinding, 2> bakeBindings = {{
+        { 0, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute },
+        { 1, vk::DescriptorType::eStorageImage,         1, vk::ShaderStageFlagBits::eCompute }
+    }};
+    iblBakeSetLayout = device.createDescriptorSetLayout(
+        vk::DescriptorSetLayoutCreateInfo({},
+            static_cast<uint32_t>(bakeBindings.size()), bakeBindings.data()));
+
+    vk::PushConstantRange bakePush(vk::ShaderStageFlagBits::eCompute, 0, 16);
+    iblBakePipelineLayout = device.createPipelineLayout(
+        vk::PipelineLayoutCreateInfo({}, 1, &iblBakeSetLayout, 1, &bakePush));
+
+    auto makeComputePipeline = [&](const char* spvName) {
+        auto code = readFile(std::string(KMRB_SHADER_SPV_DIR "/") + spvName);
+        vk::ShaderModule module = createShaderModule(device, code);
+        vk::ComputePipelineCreateInfo info({},
+            vk::PipelineShaderStageCreateInfo(
+                {}, vk::ShaderStageFlagBits::eCompute, module, "main"),
+            iblBakePipelineLayout);
+        auto result = device.createComputePipeline(nullptr, info);
+        device.destroyShaderModule(module);
+        return result.value;
+    };
+    iblBrdfPipeline       = makeComputePipeline("brdf_lut.comp.spv");
+    iblIrradiancePipeline = makeComputePipeline("irradiance.comp.spv");
+    iblPrefilterPipeline  = makeComputePipeline("prefilter.comp.spv");
+
+    // ── One-time BRDF LUT bake — depends only on the BRDF, never on the HDR ──
+    vk::DescriptorSetAllocateInfo allocInfo(descriptorPool, 1, &iblBakeSetLayout);
+    vk::DescriptorSet lutSet = device.allocateDescriptorSets(allocInfo)[0];
+    vk::DescriptorImageInfo lutDst({}, iblBrdfLutView, vk::ImageLayout::eGeneral);
+    vk::WriteDescriptorSet lutWrite(lutSet, 1, 0, 1,
+        vk::DescriptorType::eStorageImage, &lutDst);
+    device.updateDescriptorSets(lutWrite, nullptr);
+
+    vk::Queue queue = device.getQueue(graphicsQueueFamily, 0);
+    vk::CommandBuffer cmd = device.allocateCommandBuffers(
+        vk::CommandBufferAllocateInfo(commandPool, vk::CommandBufferLevel::ePrimary, 1))[0];
+    cmd.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+
+    // undefined → general (the only layout storage writes are allowed in)
+    vk::ImageMemoryBarrier toGeneral(
+        {}, vk::AccessFlagBits::eShaderWrite,
+        vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        iblBrdfLut, vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+        vk::PipelineStageFlagBits::eComputeShader, {}, nullptr, nullptr, toGeneral);
+
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, iblBrdfPipeline);
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, iblBakePipelineLayout,
+        0, lutSet, nullptr);
+    cmd.dispatch(IBL_BRDF_LUT_SIZE / 8, IBL_BRDF_LUT_SIZE / 8, 1);  // local_size = 8x8
+
+    // general → shader-read so fragment shaders can sample it
+    vk::ImageMemoryBarrier toRead(
+        vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eShaderRead,
+        vk::ImageLayout::eGeneral, vk::ImageLayout::eShaderReadOnlyOptimal,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        iblBrdfLut, vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+        vk::PipelineStageFlagBits::eFragmentShader, {}, nullptr, nullptr, toRead);
+
+    cmd.end();
+    queue.submit(vk::SubmitInfo({}, {}, cmd));
+    queue.waitIdle();
+    device.freeCommandBuffers(commandPool, cmd);
+    device.freeDescriptorSets(descriptorPool, lutSet);
+
+    writeIBLDescriptors(device);
+    Log::ok("IBL resources created (BRDF LUT baked)");
+}
+
+// Point Set 1 bindings 1-3 at the IBL images. Called at init and again if the
+// descriptor pool is rebuilt (envDescriptorSet gets reallocated then).
+void Renderer::writeIBLDescriptors(vk::Device device) {
+    vk::DescriptorImageInfo irrInfo(iblIrradianceSampler, iblIrradianceView,
+        vk::ImageLayout::eShaderReadOnlyOptimal);
+    vk::DescriptorImageInfo preInfo(iblPrefilteredSampler, iblPrefilteredView,
+        vk::ImageLayout::eShaderReadOnlyOptimal);
+    vk::DescriptorImageInfo lutInfo(iblBrdfLutSampler, iblBrdfLutView,
+        vk::ImageLayout::eShaderReadOnlyOptimal);
+    std::array<vk::WriteDescriptorSet, 3> writes = {{
+        { envDescriptorSet, 1, 0, 1, vk::DescriptorType::eCombinedImageSampler, &irrInfo },
+        { envDescriptorSet, 2, 0, 1, vk::DescriptorType::eCombinedImageSampler, &preInfo },
+        { envDescriptorSet, 3, 0, 1, vk::DescriptorType::eCombinedImageSampler, &lutInfo }
+    }};
+    device.updateDescriptorSets(writes, nullptr);
+}
+
+// Re-convolve irradiance + prefiltered from whatever envMap currently holds
+// (real HDR or the black placeholder). Called after every load/clear — both
+// call sites have already waitIdle'd, so the images are safe to overwrite.
+void Renderer::bakeIBLMaps(vk::Device device) {
+    // One descriptor set per dispatch: irradiance + one per prefilter mip.
+    // They all share the same layout; sets can't be rewritten between
+    // dispatches inside a single command buffer, hence one each.
+    std::vector<vk::DescriptorSetLayout> layouts(1 + IBL_PREFILTER_MIPS, iblBakeSetLayout);
+    auto bakeSets = device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo(
+        descriptorPool, static_cast<uint32_t>(layouts.size()), layouts.data()));
+
+    vk::DescriptorImageInfo srcInfo(envSampler, envCubemapView,
+        vk::ImageLayout::eShaderReadOnlyOptimal);
+    std::vector<vk::DescriptorImageInfo> dstInfos;
+    dstInfos.reserve(1 + IBL_PREFILTER_MIPS);
+    dstInfos.emplace_back(vk::Sampler{}, iblIrradianceStorageView, vk::ImageLayout::eGeneral);
+    for (uint32_t mip = 0; mip < IBL_PREFILTER_MIPS; mip++)
+        dstInfos.emplace_back(vk::Sampler{}, iblPrefilteredMipViews[mip], vk::ImageLayout::eGeneral);
+
+    std::vector<vk::WriteDescriptorSet> writes;
+    for (size_t i = 0; i < bakeSets.size(); i++) {
+        writes.push_back({ bakeSets[i], 0, 0, 1, vk::DescriptorType::eCombinedImageSampler, &srcInfo });
+        writes.push_back({ bakeSets[i], 1, 0, 1, vk::DescriptorType::eStorageImage, &dstInfos[i] });
+    }
+    device.updateDescriptorSets(writes, nullptr);
+
+    vk::Queue queue = device.getQueue(graphicsQueueFamily, 0);
+    vk::CommandBuffer cmd = device.allocateCommandBuffers(
+        vk::CommandBufferAllocateInfo(commandPool, vk::CommandBufferLevel::ePrimary, 1))[0];
+    cmd.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+
+    // Both targets → general. oldLayout = undefined: we overwrite every texel,
+    // so telling Vulkan to discard the old contents is free and always valid.
+    auto barrier = [&](vk::Image img, uint32_t mips,
+                       vk::AccessFlags srcAccess, vk::AccessFlags dstAccess,
+                       vk::ImageLayout from, vk::ImageLayout to,
+                       vk::PipelineStageFlags srcStage, vk::PipelineStageFlags dstStage) {
+        vk::ImageMemoryBarrier b(srcAccess, dstAccess, from, to,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img,
+            vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, mips, 0, 6));
+        cmd.pipelineBarrier(srcStage, dstStage, {}, nullptr, nullptr, b);
+    };
+    barrier(iblIrradiance, 1, {}, vk::AccessFlagBits::eShaderWrite,
+        vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral,
+        vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eComputeShader);
+    barrier(iblPrefiltered, IBL_PREFILTER_MIPS, {}, vk::AccessFlagBits::eShaderWrite,
+        vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral,
+        vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eComputeShader);
+
+    // Irradiance: one dispatch covers all 6 faces (z = layer)
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, iblIrradiancePipeline);
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, iblBakePipelineLayout,
+        0, bakeSets[0], nullptr);
+    cmd.dispatch(IBL_IRRADIANCE_SIZE / 8, IBL_IRRADIANCE_SIZE / 8, 6);
+
+    // Prefilter: one dispatch per mip, roughness spread evenly over the chain
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, iblPrefilterPipeline);
+    for (uint32_t mip = 0; mip < IBL_PREFILTER_MIPS; mip++) {
+        float roughness = static_cast<float>(mip) / static_cast<float>(IBL_PREFILTER_MIPS - 1);
+        cmd.pushConstants(iblBakePipelineLayout, vk::ShaderStageFlagBits::eCompute,
+            0, sizeof(float), &roughness);
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, iblBakePipelineLayout,
+            0, bakeSets[1 + mip], nullptr);
+        uint32_t mipSize = IBL_PREFILTERED_SIZE >> mip;  // 128, 64, 32, 16, 8 — all divisible by 8
+        cmd.dispatch(mipSize / 8, mipSize / 8, 6);
+    }
+
+    // Both targets → shader-read for the PBR fragment shaders
+    barrier(iblIrradiance, 1, vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eShaderRead,
+        vk::ImageLayout::eGeneral, vk::ImageLayout::eShaderReadOnlyOptimal,
+        vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eFragmentShader);
+    barrier(iblPrefiltered, IBL_PREFILTER_MIPS, vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eShaderRead,
+        vk::ImageLayout::eGeneral, vk::ImageLayout::eShaderReadOnlyOptimal,
+        vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eFragmentShader);
+
+    cmd.end();
+    queue.submit(vk::SubmitInfo({}, {}, cmd));
+    queue.waitIdle();
+    device.freeCommandBuffers(commandPool, cmd);
+    device.freeDescriptorSets(descriptorPool, bakeSets);
+
+    Log::info("IBL maps baked (irradiance + prefiltered specular)");
+}
+
+void Renderer::destroyIBLResources(vk::Device device) {
+    if (iblIrradianceView)        device.destroyImageView(iblIrradianceView);
+    if (iblIrradianceStorageView) device.destroyImageView(iblIrradianceStorageView);
+    if (iblIrradianceSampler)     device.destroySampler(iblIrradianceSampler);
+    if (iblIrradiance)            device.destroyImage(iblIrradiance);
+    if (iblIrradianceMemory)      device.freeMemory(iblIrradianceMemory);
+
+    if (iblPrefilteredView)       device.destroyImageView(iblPrefilteredView);
+    for (auto& view : iblPrefilteredMipViews)
+        if (view) device.destroyImageView(view);
+    if (iblPrefilteredSampler)    device.destroySampler(iblPrefilteredSampler);
+    if (iblPrefiltered)           device.destroyImage(iblPrefiltered);
+    if (iblPrefilteredMemory)     device.freeMemory(iblPrefilteredMemory);
+
+    if (iblBrdfLutView)           device.destroyImageView(iblBrdfLutView);
+    if (iblBrdfLutSampler)        device.destroySampler(iblBrdfLutSampler);
+    if (iblBrdfLut)               device.destroyImage(iblBrdfLut);
+    if (iblBrdfLutMemory)         device.freeMemory(iblBrdfLutMemory);
+
+    if (iblBrdfPipeline)          device.destroyPipeline(iblBrdfPipeline);
+    if (iblIrradiancePipeline)    device.destroyPipeline(iblIrradiancePipeline);
+    if (iblPrefilterPipeline)     device.destroyPipeline(iblPrefilterPipeline);
+    if (iblBakePipelineLayout)    device.destroyPipelineLayout(iblBakePipelineLayout);
+    if (iblBakeSetLayout)         device.destroyDescriptorSetLayout(iblBakeSetLayout);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // CLEANUP
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -2058,6 +2452,7 @@ void Renderer::cleanup(vk::Device device) {
     if (envSampler) device.destroySampler(envSampler);
     if (envCubemap) device.destroyImage(envCubemap);
     if (envCubemapMemory) device.freeMemory(envCubemapMemory);
+    destroyIBLResources(device);
     if (skyboxPipeline) device.destroyPipeline(skyboxPipeline);
     device.destroyPipeline(gridPipeline);
     device.destroyPipelineLayout(pipelineLayout);

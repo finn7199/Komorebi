@@ -1,0 +1,57 @@
+#version 450
+#include "kmrb_ibl_common.glsl"
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Prefiltered environment map — the specular half of IBL.
+//
+// Each mip level of the destination cubemap is the environment convolved with
+// the GGX lobe for one roughness value:
+//   mip 0 = roughness 0 (mirror)  …  last mip = roughness 1 (fully matte)
+// The runtime shader picks the mip with: textureLod(prefilteredMap, R, roughness*maxMip)
+//
+// The engine dispatches this shader once per mip, binding that mip as the
+// storage image and passing its roughness via push constant.
+//
+// Approximation note (same one UE4 ships with): we assume N = V = R, which
+// loses the stretched highlights at grazing angles but makes the bake
+// practical. Samples are GGX importance-sampled and weighted by NdotL.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform samplerCube srcEnv;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2DArray dstMip;
+
+layout(push_constant) uniform PushConstants {
+    float roughness;   // roughness this mip represents, 0..1
+} push;
+
+const uint SAMPLE_COUNT = 1024u;
+
+void main() {
+    ivec3 texel = ivec3(gl_GlobalInvocationID);
+    int mipSize = imageSize(dstMip).x;
+    if (texel.x >= mipSize || texel.y >= mipSize) return;
+
+    // N = V = R approximation: this texel's direction serves as all three
+    vec3 N = kmrb_cubeDir(texel, mipSize);
+    vec3 V = N;
+
+    vec3  prefiltered = vec3(0.0);
+    float totalWeight = 0.0;
+
+    for (uint i = 0u; i < SAMPLE_COUNT; i++) {
+        vec2 Xi = kmrb_hammersley(i, SAMPLE_COUNT);
+        vec3 H  = kmrb_importanceSampleGGX(Xi, N, push.roughness);
+        vec3 L  = normalize(2.0 * dot(V, H) * H - V); // reflect V about H
+
+        float NdotL = dot(N, L);
+        if (NdotL > 0.0) {
+            prefiltered += texture(srcEnv, L).rgb * NdotL;
+            totalWeight += NdotL;
+        }
+    }
+
+    prefiltered /= max(totalWeight, 0.001);
+    imageStore(dstMip, texel, vec4(prefiltered, 1.0));
+}
