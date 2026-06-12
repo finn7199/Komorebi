@@ -2,24 +2,21 @@
 
 Komorebi is a real-time 3D rendering and particle simulation editor built from scratch in C++ and Vulkan. Load 3D models, write shaders, and tweak parameters live.
 
-<table>
-  <tr>
-    <td align="center">
-      <img src="media/render.gif" alt="3D Rendering" width="420"/>
-      <br/><em>3D rendering & lighting</em>
-    </td>
-    <td align="center">
-      <img src="media/particle.gif" alt="GPU Particle Simulation" width="420"/>
-      <br/><em>GPU particle simulation</em>
-    </td>
-  </tr>
-</table>
+<img src="media/render.gif" alt="3D Rendering"/><br/>
+<em>3D rendering of thin film interference</em>
+
+<img src="media/particle.gif" alt="GPU Particle Simulation"/><br/>
+<em>GPU particle simulation - gravity with bounciness</em>
+
+<img src="media/hdr_map.jpg" alt="HDR Environment Map"/><br/>
+<em>HDR environment map - 0.5 metallic</em>
 
 ---
 
 ## Features
 
-**Real-time controls & 3D model loading**
+**Real-time controls, 3D model loading & lighting**
+
 Shader parameters appear automatically as UI sliders. Load any `.fbx`, `.obj`, or `.gltf` model, assign custom shaders, and tweak everything live.
 
 <video src="https://github.com/user-attachments/assets/f5df823d-9ad9-4401-9a95-c101aebb0b96" autoplay loop muted playsinline width="860"></video>
@@ -28,9 +25,10 @@ Shader parameters appear automatically as UI sliders. Load any `.fbx`, `.obj`, o
 ---
 
 **Live shader hot-reload & auto-generated UI**
+
 Edit a shader file and save — the engine recompiles instantly. Add a variable in GLSL and a slider appears in the Inspector automatically, no manual UI wiring needed.
 
-<video src="https://github.com/user-attachments/assets/e9950cb9-a983-4ddc-a39a-85a4439a45b9" autoplay loop muted playsinline width="860"></video>
+<video src="https://github.com/user-attachments/assets/4b6bb7df-d951-4b4f-9f30-acf61cbc1014" autoplay loop muted playsinline width="860"></video>
 <br/><em>Hot reload and auto-generated Inspector controls</em>
 
 ---
