@@ -10,6 +10,14 @@
 
 namespace kmrb {
 
+// Built-in primitive cache keys. A primitive choice is stored as a sentinel in
+// MeshRendererComponent::meshPath (the serializable field), so it round-trips through
+// save/load once that lands. The renderer recognizes PRIMITIVE_PREFIX and pulls the mesh
+// straight from the cache instead of trying to load it as a file.
+inline constexpr const char* PRIMITIVE_PREFIX = "__primitive_";
+inline constexpr const char* PRIMITIVE_CUBE   = "__primitive_cube";
+inline constexpr const char* PRIMITIVE_SPHERE = "__primitive_sphere";
+
 // CPU-side mesh data loaded from file (before GPU upload)
 struct MeshData {
     std::vector<MeshVertex> vertices;
@@ -26,7 +34,7 @@ struct GPUMesh {
 };
 
 // Loads 3D models via Assimp, uploads to GPU, and deduplicates by file path.
-// Also provides built-in primitives (cube, sphere, plane) for default entities.
+// Also provides built-in primitives (cube, sphere) for default entities.
 class MeshCache {
 public:
     // Load a mesh from file and upload to GPU. Returns cache key.
@@ -54,7 +62,6 @@ private:
     // Built-in primitive generators
     static MeshData generateCube();
     static MeshData generateSphere(int segments = 32, int rings = 16);
-    static MeshData generatePlane();
 };
 
 } // namespace kmrb

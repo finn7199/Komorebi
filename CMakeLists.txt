@@ -34,7 +34,6 @@ add_executable(Komorebi
     src/kmrb_core.hpp
     src/kmrb_renderer.cpp
     src/kmrb_renderer.hpp
-    src/kmrb_sim.cpp
     src/kmrb_sim.hpp
     src/kmrb_buffers.cpp
     src/kmrb_buffers.hpp
@@ -45,6 +44,7 @@ add_executable(Komorebi
     src/kmrb_camera.cpp
     src/kmrb_camera.hpp
     src/kmrb_types.hpp
+    src/kmrb_palette.hpp
     src/stb_image_impl.cpp
     src/kmrb_mesh.cpp
     src/kmrb_mesh.hpp
@@ -81,11 +81,17 @@ target_link_libraries(Komorebi PRIVATE
 
 # ── Shader Compilation (GLSL → SPIR-V via glslc) ──
 find_program(GLSLC glslc HINTS "${VULKAN_SDK_PATH}/Bin")
+# Runtime hot-reload compiles invoke the same glslc the build found —
+# no assumption that one is on the user's PATH
+target_compile_definitions(Komorebi PRIVATE KMRB_GLSLC_PATH="${GLSLC}")
 set(SHADER_DIR "${CMAKE_SOURCE_DIR}/shaders")
 set(SHADER_OUT_DIR "${CMAKE_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
 
 file(GLOB_RECURSE SHADERS "${SHADER_DIR}/*.vert" "${SHADER_DIR}/*.frag" "${SHADER_DIR}/*.comp")
+# Templates compile in-engine when instantiated; building them here would also
+# collide with user shaders of the same name in the flat SPV output dir
+list(FILTER SHADERS EXCLUDE REGEX "/templates/")
 
 foreach(SHADER ${SHADERS})
     get_filename_component(SHADER_NAME ${SHADER} NAME)

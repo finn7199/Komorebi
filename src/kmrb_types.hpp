@@ -3,6 +3,9 @@
 #include <vulkan/vulkan.hpp>
 #include <glm/glm.hpp>
 #include <array>
+#include <iterator>
+#include <string>
+#include <vector>
 
 namespace kmrb {
 
@@ -73,6 +76,18 @@ struct Particle {
     glm::vec4 velocity;  // xyz = velocity, w = lifetime
     glm::vec4 color;     // rgba
 };
+
+// CSV column names for the Particle layout above — every export path shares
+// this list so the layout is described in exactly one place.
+inline constexpr const char* PARTICLE_CSV_COLUMNS[12] = {
+    "pos.x", "pos.y", "pos.z", "size",
+    "vel.x", "vel.y", "vel.z", "lifetime",
+    "r", "g", "b", "a"
+};
+
+inline std::vector<std::string> particleCSVColumns() {
+    return { std::begin(PARTICLE_CSV_COLUMNS), std::end(PARTICLE_CSV_COLUMNS) };
+}
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // VERTEX FORMATS

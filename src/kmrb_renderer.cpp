@@ -1,5 +1,6 @@
 #include "kmrb_ui.hpp"
 #include "kmrb_renderer.hpp"
+#include "kmrb_palette.hpp"
 #include <imgui.h>
 #include <imgui_impl_vulkan.h>
 #include <glm/gtc/matrix_transform.hpp>
@@ -7,11 +8,10 @@
 #include <iostream>
 #include <stdexcept>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
-#include <bit>
 #include <array>
-#include <execution>
 #include "spirv_reflect.h"
 #include <stb_image.h>
 
@@ -33,7 +33,6 @@ void Renderer::init(GLFWwindow* window, vk::Instance instance,
     particleCount = initialParticleCount;
 
     bufferManager.init(device, gpu);
-    camera.init(glm::vec3(0.0f, 2.0f, 5.0f), -15.0f, -90.0f);
 
     appStartTime = std::chrono::steady_clock::now();
     lastFrameTime = appStartTime;
@@ -68,7 +67,7 @@ void Renderer::init(GLFWwindow* window, vk::Instance instance,
     createIBLResources(device);
     bakeIBLMaps(device);
 
-    // Load built-in mesh primitives (cube, sphere, plane) so mesh entities work immediately
+    // Load built-in mesh primitives (cube, sphere) so mesh entities work immediately
     meshCache.loadPrimitives(bufferManager);
 
     ui.init(window, instance, gpu, device, graphicsQueueFamily,
@@ -308,9 +307,9 @@ void Renderer::updateGridBuffer(vk::Device device) {
     gridVertexCount = static_cast<uint32_t>(vertices.size());
     vk::DeviceSize bufSize = sizeof(glm::vec3) * gridVertexCount;
 
-    // Allocate max-size buffer once, re-upload data each update
-    // Max: 100 cells × 2 axes × 2 verts per line = 808 verts
-    constexpr vk::DeviceSize maxGridBufSize = sizeof(glm::vec3) * 808;
+    // Allocate max-size buffer once, re-upload data each update.
+    // Max: (100 cells + 1) lines × 2 axes × 2 verts per line = 404 verts
+    constexpr vk::DeviceSize maxGridBufSize = sizeof(glm::vec3) * 404;
 
     if (!bufferManager.exists("grid_lines")) {
         bufferManager.createBuffer("grid_lines", maxGridBufSize,
@@ -394,9 +393,7 @@ void Renderer::updateGizmoBuffer(vk::Device device) {
         uint32_t first = static_cast<uint32_t>(gizmoVerts.size());
         if (first + worstCasePerLight > maxGizmoVerts) return;  // Buffer full — skip extra lights
 
-        float pitch = glm::radians(lt.rotation.x);
-        float yaw   = glm::radians(lt.rotation.y);
-        glm::vec3 dir(cosf(pitch) * sinf(yaw), -sinf(pitch), -cosf(pitch) * cosf(yaw));
+        glm::vec3 dir = lightDirectionFromEuler(lt.rotation);
 
         if (lc.type == LightType::Point) {
             appendSphereRings(gizmoVerts, lt.position, 0.3f, 24);
@@ -445,9 +442,7 @@ void Renderer::drawLightGizmos(vk::CommandBuffer cmd, uint32_t imageIndex) {
         PushConstants push{};
         push.model = glm::mat4(1.0f);
         // Selected light uses the editor's golden accent color
-        push.color = dc.selected
-            ? glm::vec4(0.78f, 0.64f, 0.30f, 1.0f)
-            : dc.color;
+        push.color = dc.selected ? palette::toVec4(palette::Gold) : dc.color;
         cmd.pushConstants(pipelineLayout,
             vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eCompute,
             0, sizeof(PushConstants), &push);
@@ -616,6 +611,23 @@ void Renderer::createParticleBuffer(vk::Device device) {
         bufferManager.setElementInfo(names[i], particleCount, sizeof(Particle));
     }
 
+    writeParticleDescriptors(device);
+
+    // Zero-fill so shaders never read undefined VRAM before the init shader runs
+    std::vector<Particle> zeros(particleCount);
+    for (int i = 0; i < 2; i++)
+        bufferManager.upload(names[i], zeros.data(), bufferSize);
+
+    kmrb::Log::info("Particle SSBOs allocated (2x " + std::to_string(particleCount) + ")");
+}
+
+// Point the two ping-pong descriptor sets at the particle buffers.
+// Set i reads names[i] (binding 0) and writes names[1-i] (binding 1).
+// Shared by buffer (re)creation and descriptor-pool rebuilds — keep the
+// wiring defined once.
+void Renderer::writeParticleDescriptors(vk::Device device) {
+    vk::DeviceSize bufferSize = sizeof(Particle) * particleCount;
+    const char* names[] = { "particle_a", "particle_b" };
     for (int i = 0; i < 2; i++) {
         vk::DescriptorBufferInfo inputInfo(bufferManager.getBuffer(names[i]), 0, bufferSize);
         vk::DescriptorBufferInfo outputInfo(bufferManager.getBuffer(names[1 - i]), 0, bufferSize);
@@ -625,16 +637,17 @@ void Renderer::createParticleBuffer(vk::Device device) {
         }};
         device.updateDescriptorSets(writes, nullptr);
     }
-
-    kmrb::Log::info("Particle SSBOs allocated (2x " + std::to_string(particleCount) + ")");
 }
 
-void Renderer::uploadParticles(vk::Device device, const std::vector<Particle>& particles) {
-    particleCount = static_cast<uint32_t>(particles.size());
+// Zero both SSBOs and restart the sim timeline — the init shader repopulates
+// them on the next frame. Caller must waitIdle first (buffers may be in flight).
+void Renderer::resetParticleBuffers(vk::Device device) {
+    std::vector<Particle> zeros(particleCount);
     vk::DeviceSize bufferSize = sizeof(Particle) * particleCount;
-    bufferManager.upload("particle_a", particles.data(), bufferSize);
-    bufferManager.upload("particle_b", particles.data(), bufferSize);
-    kmrb::Log::ok("Particles uploaded (" + std::to_string(particleCount) + " from ECS)");
+    bufferManager.upload("particle_a", zeros.data(), bufferSize);
+    bufferManager.upload("particle_b", zeros.data(), bufferSize);
+    simFrame = 0;
+    requestInitDispatch();
 }
 
 
@@ -677,32 +690,26 @@ void Renderer::updateGlobalUBO(uint32_t imageIndex) {
     float time = std::chrono::duration<float>(
         std::chrono::steady_clock::now() - appStartTime).count();
 
-    // Read FOV/near/far from the active camera entity, fall back to defaults
-    float fov = 45.0f;
-    float nearPlane = 0.1f;
-    float farPlane = 100.0f;
-
+    // Projection params from the active camera entity. A default-constructed
+    // component supplies the fallback, so the defaults live only in the struct.
+    CameraComponent camProps{};
     if (registry) {
         auto camView = registry->view<CameraComponent>();
         for (auto entity : camView) {
             auto& props = camView.get<CameraComponent>(entity);
-            if (props.active) {
-                fov = props.fov;
-                nearPlane = props.nearPlane;
-                farPlane = props.farPlane;
-                break;
-            }
+            if (props.active) { camProps = props; break; }
         }
     }
 
     GlobalUBO ubo{};
     ubo.view = camera.getViewMatrix();
-    ubo.proj = glm::perspective(glm::radians(fov),
-        static_cast<float>(extent.width) / static_cast<float>(extent.height), nearPlane, farPlane);
+    ubo.proj = glm::perspective(glm::radians(camProps.fov),
+        static_cast<float>(extent.width) / static_cast<float>(extent.height),
+        camProps.nearPlane, camProps.farPlane);
     ubo.proj[1][1] *= -1;
     ubo.cameraPos = glm::vec4(camera.position, 1.0f);
     float rawDt = time - elapsedTime;
-    ubo.deltaTime = std::min(rawDt, 0.033f); // Cap at ~30fps — prevents physics explosion after pauses
+    ubo.deltaTime = std::min(rawDt, MAX_SIM_TIMESTEP);
     ubo.time = time;
     elapsedTime = time;
 
@@ -713,10 +720,8 @@ void Renderer::updateGlobalUBO(uint32_t imageIndex) {
             if (ubo.lightCount >= static_cast<int>(MAX_LIGHTS)) return;
             GPULight& gpu = ubo.lights[ubo.lightCount];
             gpu.positionAndType = glm::vec4(lt.position, static_cast<float>(lc.type));
-            float pitch = glm::radians(lt.rotation.x);
-            float yaw   = glm::radians(lt.rotation.y);
-            glm::vec3 dir(cos(pitch) * sin(yaw), -sin(pitch), -cos(pitch) * cos(yaw));
-            gpu.directionAndAngle = glm::vec4(glm::normalize(dir), cos(glm::radians(lc.spotAngle)));
+            glm::vec3 dir = lightDirectionFromEuler(lt.rotation);  // Unit by construction
+            gpu.directionAndAngle = glm::vec4(dir, cos(glm::radians(lc.spotAngle)));
             gpu.colorAndIntensity = glm::vec4(lc.color, lc.intensity);
             gpu.params = glm::vec4(lc.radius, 0, 0, 0);
             ubo.lightCount++;
@@ -781,7 +786,8 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
 
     // ── COMPUTE (skip when init just ran — it would overwrite init data with zeros) ──
     bool shouldDispatch = ui.shouldDispatchCompute() && !initRanThisFrame;
-    if (shouldDispatch && activeInstance && activeInstance->computePipeline) {
+    bool computeDispatched = shouldDispatch && activeInstance && activeInstance->computePipeline;
+    if (computeDispatched) {
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute, activeInstance->computePipeline);
         cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipelineLayout,
             DESCRIPTOR_SET_GLOBAL, globalDescriptorSets[imageIndex], nullptr);
@@ -819,8 +825,9 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
     }
 
     // ── OFFSCREEN PASS ──
+    glm::vec4 vpClear = palette::toVec4(palette::ViewportBg);
     std::array<vk::ClearValue, 2> offscreenClear = {
-        vk::ClearValue(vk::ClearColorValue(std::array<float,4>{0.04f, 0.04f, 0.06f, 1.0f})),
+        vk::ClearValue(vk::ClearColorValue(std::array<float,4>{vpClear.r, vpClear.g, vpClear.b, 1.0f})),
         vk::ClearValue(vk::ClearDepthStencilValue(1.0f, 0))
     };
 
@@ -966,7 +973,8 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
     cmd.endRenderPass();
 
     // ── SWAPCHAIN PASS: ImGui only ──
-    vk::ClearValue swapClear(vk::ClearColorValue(std::array<float,4>{0.055f, 0.051f, 0.043f, 1.0f}));
+    glm::vec4 bgClear = palette::toVec4(palette::Base);
+    vk::ClearValue swapClear(vk::ClearColorValue(std::array<float,4>{bgClear.r, bgClear.g, bgClear.b, 1.0f}));
     cmd.beginRenderPass(vk::RenderPassBeginInfo(
         swapchainPass, swapchainFramebuffers[imageIndex],
         vk::Rect2D({0,0}, extent), 1, &swapClear),
@@ -981,6 +989,51 @@ void Renderer::recordCommandBuffer(vk::CommandBuffer cmd, uint32_t imageIndex) {
     // Init writes to binding 1 (output). Flipping makes that buffer the input for
     // next frame's compute shader, so it reads the init data instead of zeros.
     if (shouldDispatch || initRanThisFrame) pingPong = 1 - pingPong;
+
+    // Sim-frame counter: init (re)defines frame 0, each compute step advances by one
+    if (initRanThisFrame) simFrame = 0;
+    else if (computeDispatched) simFrame++;
+    simSteppedThisFrame = initRanThisFrame || computeDispatched;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// RECORDING (frame export)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// VCR-style: the Export tab's record toggle is the whole interface. While it's
+// on, every sim step is read back and written as its own CSV, named by sim
+// frame (name_0042.csv). Pausing the sim pauses the recording; Step captures
+// single frames. Called after queue submit: the read-back's one-shot copy
+// lands on the same queue behind this frame's compute dispatch, so it sees
+// the new state.
+
+void Renderer::updateFrameExport(vk::Device device) {
+    bool recording = ui.isRecording();
+    bool startEdge = recording && !wasRecording;
+
+    if (startEdge) {
+        exportFilesWritten = 0;
+        Log::ok("Recording started at sim frame " + std::to_string(simFrame));
+    } else if (!recording && wasRecording) {
+        Log::ok("Recording stopped: " + std::to_string(exportFilesWritten) + " frame(s) written");
+    }
+    wasRecording = recording;
+
+    if (!recording) return;
+    // Capture on every sim step — and once on start, so hitting record while
+    // paused still snapshots the current state as the first frame.
+    if (!simSteppedThisFrame && !startEdge) return;
+
+    namespace fs = std::filesystem;
+    fs::path base(ui.getExportPath());
+    char suffix[24];
+    snprintf(suffix, sizeof(suffix), "_%04llu", static_cast<unsigned long long>(simFrame));
+    std::string ext = base.has_extension() ? base.extension().string() : ".csv";
+    fs::path out = base.parent_path() / (base.stem().string() + suffix + ext);
+
+    bufferManager.exportToCSV(getLatestParticleBufferName(), out.generic_string(),
+                              particleCSVColumns());
+    exportFilesWritten++;
+    ui.setRecordedFrameCount(exportFilesWritten);
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -996,9 +1049,11 @@ bool Renderer::drawFrame(vk::Device device, vk::SwapchainKHR swapchain,
     lastFrameTime = now;
     frameDt = std::min(frameDt, 0.1f);  // Clamp gaps from window drags / debugger pauses
 
-    // Poll shader files for hot-reload every 30 frames (not every frame)
-    if (++hotReloadCounter >= 30) {
-        hotReloadCounter = 0;
+    // Poll shader files for hot-reload on a timer — frame-rate independent
+    // (a frame counter would poll 5x/s at 300 fps but lag badly at 20 fps)
+    hotReloadTimer += frameDt;
+    if (hotReloadTimer >= HOT_RELOAD_POLL_SEC) {
+        hotReloadTimer = 0.0f;
         syncShaderInstances(device);
         syncMeshInstances(device);
         updateGridBuffer(device);
@@ -1029,34 +1084,25 @@ bool Renderer::drawFrame(vk::Device device, vk::SwapchainKHR swapchain,
         Log::ok("Render resolution: " + std::to_string(renderExtent.width) + "x" + std::to_string(renderExtent.height));
     }
 
-    // Particle count change — reallocate SSBOs and re-run init shader
-    if (ui.isParticleCountDirty()) {
-        device.waitIdle();
-        uint32_t newCount = static_cast<uint32_t>(ui.getParticleCount());
-        vk::DeviceSize bufferSize = sizeof(Particle) * newCount;
-        bufferManager.destroyBuffer("particle_a");
-        bufferManager.destroyBuffer("particle_b");
-        const char* names[] = { "particle_a", "particle_b" };
-        for (int i = 0; i < 2; i++) {
-            bufferManager.createBuffer(names[i], bufferSize,
-                vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eVertexBuffer,
-                vk::MemoryPropertyFlagBits::eDeviceLocal);
-            bufferManager.setElementInfo(names[i], newCount, sizeof(Particle));
+    // Particle count change — PipelineComponent is the single source of truth.
+    // The first Pipeline entity drives the SSBO size (V1 has one active pipeline).
+    // createParticleBuffer recreates the buffers, rebinds the descriptor sets,
+    // and zero-fills; the init shader then repopulates on the next frame.
+    if (registry) {
+        uint32_t targetCount = particleCount;
+        for (auto e : registry->view<PipelineComponent>()) {
+            targetCount = registry->get<PipelineComponent>(e).particleCount;
+            break;
         }
-        // Re-bind descriptor sets for new buffers
-        for (int i = 0; i < 2; i++) {
-            vk::DescriptorBufferInfo inputInfo(bufferManager.getBuffer(names[i]), 0, bufferSize);
-            vk::DescriptorBufferInfo outputInfo(bufferManager.getBuffer(names[1 - i]), 0, bufferSize);
-            std::array<vk::WriteDescriptorSet, 2> writes = {{
-                { particleDescriptorSets[i], 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &inputInfo },
-                { particleDescriptorSets[i], 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &outputInfo }
-            }};
-            device.updateDescriptorSets(writes, nullptr);
+        if (targetCount > 0 && targetCount != particleCount) {
+            device.waitIdle();
+            particleCount = targetCount;
+            createParticleBuffer(device);
+            pingPong = 0;
+            simFrame = 0;
+            requestInitDispatch();
+            Log::ok("Particle count: " + std::to_string(particleCount));
         }
-        particleCount = newCount;
-        pingPong = 0;
-        requestInitDispatch();  // Re-run init shader to fill new buffer
-        Log::ok("Particle count: " + std::to_string(newCount));
     }
 
     // Camera — two-way sync with active camera entity
@@ -1117,6 +1163,11 @@ bool Renderer::drawFrame(vk::Device device, vk::SwapchainKHR swapchain,
     vk::SubmitInfo submitInfo(1, waitSems, waitStages,
         1, &commandBuffers[imageIndex], 1, signalSems);
     graphicsQueue.submit(submitInfo, inFlightFences[currentFrame]);
+
+    // Recording — must run after submit (read-back queues behind this frame's compute)
+    updateFrameExport(device);
+    ui.setSimFrame(simFrame);
+    ui.setLatestParticleBuffer(getLatestParticleBufferName());
 
     vk::PresentInfoKHR presentInfo(1, signalSems, 1, &swapchain, &imageIndex);
     bool needsRecreate = false;
@@ -1202,18 +1253,8 @@ void Renderer::onSwapchainRecreate(vk::Device device, vk::Extent2D newExtent,
             writeIBLDescriptors(device);
         }
 
-        // Re-wire particle buffers to new descriptor sets
-        vk::DeviceSize bufferSize = sizeof(Particle) * particleCount;
-        const char* names[] = { "particle_a", "particle_b" };
-        for (int i = 0; i < 2; i++) {
-            vk::DescriptorBufferInfo inputInfo(bufferManager.getBuffer(names[i]), 0, bufferSize);
-            vk::DescriptorBufferInfo outputInfo(bufferManager.getBuffer(names[1 - i]), 0, bufferSize);
-            std::array<vk::WriteDescriptorSet, 2> writes = {{
-                { particleDescriptorSets[i], 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &inputInfo },
-                { particleDescriptorSets[i], 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &outputInfo }
-            }};
-            device.updateDescriptorSets(writes, nullptr);
-        }
+        // Re-wire particle buffers to the freshly allocated descriptor sets
+        writeParticleDescriptors(device);
 
         createCommandPool(device, graphicsQueueFamily);
         // The old command pool handle is stale — re-point staging copies at the new one
@@ -1390,16 +1431,19 @@ void Renderer::syncMeshInstances(vk::Device device) {
         auto& mesh = view.get<MeshRendererComponent>(entity);
         uint32_t key = static_cast<uint32_t>(entity);
 
-        // Load mesh if path is set but not yet cached
+        // Resolve meshPath → meshCacheKey if not yet cached.
         if (!mesh.meshPath.empty() && mesh.meshCacheKey.empty()) {
-            mesh.meshCacheKey = meshCache.load(mesh.meshPath, bufferManager);
-            if (mesh.meshCacheKey.empty()) mesh.meshPath.clear(); // Load failed
+            // A primitive sentinel (e.g. "__primitive_sphere") is already uploaded by
+            // loadPrimitives(), so use it directly instead of an Assimp file load.
+            if (mesh.meshPath.rfind(PRIMITIVE_PREFIX, 0) == 0) {
+                mesh.meshCacheKey = mesh.meshPath;
+            } else {
+                mesh.meshCacheKey = meshCache.load(mesh.meshPath, bufferManager);
+                if (mesh.meshCacheKey.empty()) mesh.meshPath.clear(); // Load failed
+            }
         }
-
-        // Default to cube primitive if no mesh file specified
-        if (mesh.meshCacheKey.empty()) {
-            mesh.meshCacheKey = "__primitive_cube";
-        }
+        // No fallback geometry: an empty meshPath leaves meshCacheKey empty, and the draw
+        // loop's meshCache.exists() guard skips it — an unassigned mesh renders nothing.
 
         // Sync GPU stats to component so the UI Data Output panel can display them
         if (meshCache.exists(mesh.meshCacheKey)) {
@@ -1509,7 +1553,8 @@ void Renderer::clearMeshCache(vk::Device device) {
     // Destroy GPU vertex/index buffers and clear the cache map
     meshCache.cleanup(bufferManager);
 
-    // Re-upload built-in primitives so the default cube fallback still works
+    // Re-upload built-in primitives so entities referencing a "__primitive_*" mesh
+    // (cube / sphere) still resolve after the cache is cleared.
     meshCache.loadPrimitives(bufferManager);
 
     // Reset all MeshRendererComponent state so syncMeshInstances reloads everything
@@ -1751,11 +1796,13 @@ std::vector<uint32_t> Renderer::compileGLSL(const std::string& sourcePath) {
     std::string outputPath = sourcePath + ".tmp.spv";
     // -g preserves variable names (OpName) in SPIR-V so SPIRV-Reflect can read them.
     // Without it, -O strips names and reflected params show as "unnamed".
-    std::string cmd = "glslc --target-env=vulkan1.3 -O -g";
+    std::string cmd = "\"" KMRB_GLSLC_PATH "\" --target-env=vulkan1.3 -O -g";
     cmd += " -I \"" + std::string(KMRB_SHADER_DIR) + "/include\"";
     cmd += " \"" + sourcePath + "\" -o \"" + outputPath + "\" 2>&1";
 
-    FILE* pipe = _popen(cmd.c_str(), "r");
+    // cmd.exe strips the first and last quote of a /c string — wrap the whole
+    // command in an extra pair so the quoted glslc path survives the strip
+    FILE* pipe = _popen(("\"" + cmd + "\"").c_str(), "r");
     if (!pipe) { kmrb::Log::error("Failed to run glslc"); return {}; }
 
     std::string compilerOutput;
@@ -1764,7 +1811,14 @@ std::vector<uint32_t> Renderer::compileGLSL(const std::string& sourcePath) {
     int exitCode = _pclose(pipe);
 
     if (exitCode != 0) {
-        kmrb::Log::error("Shader compilation error:\n");
+        // Surface glslc's actual message — users live in GLSL, this is their
+        // primary feedback loop
+        while (!compilerOutput.empty() &&
+               (compilerOutput.back() == '\n' || compilerOutput.back() == '\r'))
+            compilerOutput.pop_back();
+        kmrb::Log::error(compilerOutput.empty()
+            ? "Shader compilation failed (no compiler output): " + sourcePath
+            : "Shader compilation failed:\n" + compilerOutput);
         std::filesystem::remove(outputPath);
         return {};
     }
@@ -1800,8 +1854,9 @@ std::vector<char> Renderer::readFile(const std::string& filename) {
 // ENVIRONMENT MAP
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// Helper: create a VkImage cubemap, allocate memory, create view and sampler.
-// Used by both the 1x1 placeholder and the real HDR environment map.
+// Helper: create a VkImage cubemap from CPU pixel data via staging upload.
+// Only the 1x1 black placeholder uses this — real HDR maps are converted on
+// the GPU by equirect_to_cube.comp (see loadEnvironmentMap).
 static void createCubemapResources(
     vk::Device device, vk::PhysicalDevice gpu,
     uint32_t faceSize, vk::Format format, const void* pixelData, vk::DeviceSize dataSize,
@@ -1864,11 +1919,8 @@ static void createCubemapResources(
     cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
         vk::PipelineStageFlagBits::eTransfer, {}, nullptr, nullptr, toTransfer);
 
-    // Copy staging buffer → cubemap faces
+    // Copy staging buffer → cubemap faces (dataSize / 6 keeps this format-agnostic)
     std::vector<vk::BufferImageCopy> copies(6);
-    vk::DeviceSize faceBytes = static_cast<vk::DeviceSize>(faceSize) * faceSize * 4 * sizeof(uint16_t);
-    // For placeholder (R16G16B16A16), faceBytes is small. For real HDR, computed from format.
-    // We use dataSize / 6 to be format-agnostic.
     vk::DeviceSize bytesPerFace = dataSize / 6;
     for (uint32_t face = 0; face < 6; face++) {
         copies[face] = vk::BufferImageCopy(
@@ -1976,87 +2028,171 @@ void Renderer::loadEnvironmentMap(vk::Device device, const std::string& hdrPath)
     envCubemapView = nullptr; envSampler = nullptr;
     envCubemap = nullptr; envCubemapMemory = nullptr;
 
-    // Decide cubemap face size — use height of equirectangular image (2:1 aspect ratio).
-    // Cap at 1024 for VRAM sanity.
-    uint32_t faceSize = std::min(static_cast<uint32_t>(height), 1024u);
+    // Face size from the equirect height (2:1 panorama), capped for VRAM
+    uint32_t faceSize = std::min(static_cast<uint32_t>(height), ENV_CUBEMAP_MAX_FACE);
 
-    // Convert equirectangular → 6 cubemap faces on CPU.
-    // For each face pixel, compute the 3D direction, convert to equirect UV, sample.
-    // Store as R16G16B16A16 (half-float) to save VRAM while preserving HDR range.
-    uint32_t facePixels = faceSize * faceSize;
-    std::vector<uint16_t> cubemapData(6 * facePixels * 4);
+    // The resampling itself runs in GLSL (equirect_to_cube.comp): the CPU only
+    // uploads the raw panorama as a texture and dispatches the convert. The
+    // shader samples bilinearly with a wrapping U sampler — better quality
+    // than the old CPU nearest-neighbor loop, and no seam at the atan2 wrap.
 
-    // Half-float conversion helper (IEEE 754 binary16)
-    auto floatToHalf = [](float f) -> uint16_t {
-        uint32_t bits = std::bit_cast<uint32_t>(f);  // Type-pun safely (no aliasing UB)
-        uint32_t sign = (bits >> 16) & 0x8000;
-        int32_t exp = ((bits >> 23) & 0xFF) - 127 + 15;
-        uint32_t mant = bits & 0x7FFFFF;
-        if (exp <= 0) return static_cast<uint16_t>(sign); // Underflow → 0
-        if (exp >= 31) return static_cast<uint16_t>(sign | 0x7C00); // Overflow → inf
-        return static_cast<uint16_t>(sign | (exp << 10) | (mant >> 13));
+    auto findMem = [&](vk::MemoryRequirements reqs, vk::MemoryPropertyFlags props) -> uint32_t {
+        auto memProps = physicalDevice.getMemoryProperties();
+        for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+            if ((reqs.memoryTypeBits & (1 << i)) && (memProps.memoryTypes[i].propertyFlags & props) == props)
+                return i;
+        }
+        throw std::runtime_error("KMRB: No suitable memory type");
     };
 
-    // Direction vectors for each cubemap face.
-    // For face (u,v) in [0,1]², these define the 3D direction to sample.
-    // face 0: +X, face 1: -X, face 2: +Y, face 3: -Y, face 4: +Z, face 5: -Z
-    // Each face writes a disjoint range of cubemapData → safe to convert in parallel.
-    std::array<uint32_t, 6> faces = { 0, 1, 2, 3, 4, 5 };
-    std::for_each(std::execution::par, faces.begin(), faces.end(), [&](uint32_t face) {
-        for (uint32_t y = 0; y < faceSize; y++) {
-            for (uint32_t x = 0; x < faceSize; x++) {
-                // Map pixel to [-1, 1] range
-                float u = (static_cast<float>(x) + 0.5f) / faceSize * 2.0f - 1.0f;
-                float v = (static_cast<float>(y) + 0.5f) / faceSize * 2.0f - 1.0f;
+    // ── Transient equirect source texture (RGBA32F, exactly what stb gives us) ──
+    const auto srcFormat = vk::Format::eR32G32B32A32Sfloat;
+    vk::DeviceSize srcSize = static_cast<vk::DeviceSize>(width) * height * 4 * sizeof(float);
 
-                // Compute 3D direction for this face and pixel
-                float dx, dy, dz;
-                switch (face) {
-                    case 0: dx =  1; dy = -v; dz = -u; break;  // +X
-                    case 1: dx = -1; dy = -v; dz =  u; break;  // -X
-                    case 2: dx =  u; dy =  1; dz =  v; break;  // +Y
-                    case 3: dx =  u; dy = -1; dz = -v; break;  // -Y
-                    case 4: dx =  u; dy = -v; dz =  1; break;  // +Z
-                    case 5: dx = -u; dy = -v; dz = -1; break;  // -Z
-                    default: dx = dy = dz = 0; break;
-                }
+    vk::Image srcImage = device.createImage(vk::ImageCreateInfo(
+        {}, vk::ImageType::e2D, srcFormat, vk::Extent3D(width, height, 1), 1, 1,
+        vk::SampleCountFlagBits::e1, vk::ImageTiling::eOptimal,
+        vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
+        vk::SharingMode::eExclusive));
+    auto srcReqs = device.getImageMemoryRequirements(srcImage);
+    vk::DeviceMemory srcMemory = device.allocateMemory(
+        vk::MemoryAllocateInfo(srcReqs.size, findMem(srcReqs, vk::MemoryPropertyFlagBits::eDeviceLocal)));
+    device.bindImageMemory(srcImage, srcMemory, 0);
 
-                // Normalize direction
-                float len = std::sqrt(dx*dx + dy*dy + dz*dz);
-                dx /= len; dy /= len; dz /= len;
+    vk::ImageView srcView = device.createImageView(vk::ImageViewCreateInfo(
+        {}, srcImage, vk::ImageViewType::e2D, srcFormat, {},
+        vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1)));
 
-                // Convert direction to equirectangular UV
-                float theta = std::atan2(dz, dx);             // -pi to pi
-                float phi = std::asin(std::clamp(dy, -1.0f, 1.0f));  // -pi/2 to pi/2
-                float eqU = (theta / (2.0f * 3.14159265f)) + 0.5f;   // 0 to 1
-                float eqV = (phi / 3.14159265f) + 0.5f;              // 0 to 1
+    // Linear filtering on 32-bit float images is optional in the Vulkan spec
+    // (mandatory only for 16F) — query and fall back to nearest if unsupported
+    auto srcFmtProps = physicalDevice.getFormatProperties(srcFormat);
+    vk::Filter srcFilter =
+        (srcFmtProps.optimalTilingFeatures & vk::FormatFeatureFlagBits::eSampledImageFilterLinear)
+            ? vk::Filter::eLinear : vk::Filter::eNearest;
+    // U wraps so the equirect seam interpolates across the atan2 wrap; V clamps
+    vk::Sampler srcSampler = device.createSampler(vk::SamplerCreateInfo(
+        {}, srcFilter, srcFilter, vk::SamplerMipmapMode::eNearest,
+        vk::SamplerAddressMode::eRepeat, vk::SamplerAddressMode::eClampToEdge,
+        vk::SamplerAddressMode::eClampToEdge));
 
-                // Sample equirectangular image (nearest neighbor)
-                float sx = eqU * (width - 1);
-                float sy = (1.0f - eqV) * (height - 1);  // Flip V
-                int ix = std::clamp(static_cast<int>(sx), 0, width - 1);
-                int iy = std::clamp(static_cast<int>(sy), 0, height - 1);
-                const float* pixel = hdrData + (iy * width + ix) * 4;
-
-                // Write as half-float
-                uint32_t dstIdx = (face * facePixels + y * faceSize + x) * 4;
-                cubemapData[dstIdx + 0] = floatToHalf(pixel[0]);
-                cubemapData[dstIdx + 1] = floatToHalf(pixel[1]);
-                cubemapData[dstIdx + 2] = floatToHalf(pixel[2]);
-                cubemapData[dstIdx + 3] = floatToHalf(1.0f);
-            }
-        }
-    });
-
+    // Stage the raw pixels for upload
+    vk::Buffer staging = device.createBuffer(
+        vk::BufferCreateInfo({}, srcSize, vk::BufferUsageFlagBits::eTransferSrc));
+    auto stagingReqs = device.getBufferMemoryRequirements(staging);
+    vk::DeviceMemory stagingMem = device.allocateMemory(vk::MemoryAllocateInfo(
+        stagingReqs.size, findMem(stagingReqs,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)));
+    device.bindBufferMemory(staging, stagingMem, 0);
+    void* mapped = device.mapMemory(stagingMem, 0, srcSize);
+    memcpy(mapped, hdrData, srcSize);
+    device.unmapMemory(stagingMem);
     stbi_image_free(hdrData);
 
-    // Upload cubemap to GPU
+    // ── Env cubemap: sampled by shaders, written by the convert dispatch ──
+    vk::ImageCreateInfo cubeInfo(
+        vk::ImageCreateFlagBits::eCubeCompatible,
+        vk::ImageType::e2D, vk::Format::eR16G16B16A16Sfloat,
+        vk::Extent3D(faceSize, faceSize, 1), 1, 6,
+        vk::SampleCountFlagBits::e1, vk::ImageTiling::eOptimal,
+        vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage,
+        vk::SharingMode::eExclusive);
+    envCubemap = device.createImage(cubeInfo);
+    auto cubeReqs = device.getImageMemoryRequirements(envCubemap);
+    envCubemapMemory = device.allocateMemory(
+        vk::MemoryAllocateInfo(cubeReqs.size, findMem(cubeReqs, vk::MemoryPropertyFlagBits::eDeviceLocal)));
+    device.bindImageMemory(envCubemap, envCubemapMemory, 0);
+
+    envCubemapView = device.createImageView(vk::ImageViewCreateInfo(
+        {}, envCubemap, vk::ImageViewType::eCube, vk::Format::eR16G16B16A16Sfloat, {},
+        vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 6)));
+    // Compute writes go through a 2D-array view, same as the IBL bake targets
+    vk::ImageView cubeStorageView = device.createImageView(vk::ImageViewCreateInfo(
+        {}, envCubemap, vk::ImageViewType::e2DArray, vk::Format::eR16G16B16A16Sfloat, {},
+        vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 6)));
+    envSampler = device.createSampler(vk::SamplerCreateInfo(
+        {}, vk::Filter::eLinear, vk::Filter::eLinear, vk::SamplerMipmapMode::eLinear,
+        vk::SamplerAddressMode::eClampToEdge, vk::SamplerAddressMode::eClampToEdge,
+        vk::SamplerAddressMode::eClampToEdge));
+
+    // Descriptor set for the convert — same {sampler, storage image} layout as
+    // the IBL bakes (sampler2D and samplerCube are the same descriptor type)
+    vk::DescriptorSet convertSet = device.allocateDescriptorSets(
+        vk::DescriptorSetAllocateInfo(descriptorPool, 1, &iblBakeSetLayout))[0];
+    vk::DescriptorImageInfo srcDesc(srcSampler, srcView, vk::ImageLayout::eShaderReadOnlyOptimal);
+    vk::DescriptorImageInfo dstDesc({}, cubeStorageView, vk::ImageLayout::eGeneral);
+    std::array<vk::WriteDescriptorSet, 2> convertWrites = {{
+        { convertSet, 0, 0, 1, vk::DescriptorType::eCombinedImageSampler, &srcDesc },
+        { convertSet, 1, 0, 1, vk::DescriptorType::eStorageImage, &dstDesc }
+    }};
+    device.updateDescriptorSets(convertWrites, nullptr);
+
+    // ── One-shot: upload the panorama, then convert to cube faces on the GPU ──
     vk::Queue queue = device.getQueue(graphicsQueueFamily, 0);
-    createCubemapResources(device, physicalDevice, faceSize,
-        vk::Format::eR16G16B16A16Sfloat, cubemapData.data(),
-        cubemapData.size() * sizeof(uint16_t),
-        envCubemap, envCubemapMemory, envCubemapView, envSampler,
-        commandPool, queue);
+    vk::CommandBuffer cmd = device.allocateCommandBuffers(
+        vk::CommandBufferAllocateInfo(commandPool, vk::CommandBufferLevel::ePrimary, 1))[0];
+    cmd.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+
+    // Equirect: undefined → transfer dst → copy → shader read
+    vk::ImageMemoryBarrier srcToTransfer(
+        {}, vk::AccessFlagBits::eTransferWrite,
+        vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, srcImage,
+        vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+        vk::PipelineStageFlagBits::eTransfer, {}, nullptr, nullptr, srcToTransfer);
+
+    vk::BufferImageCopy copyRegion(0, 0, 0,
+        vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1),
+        vk::Offset3D(0, 0, 0), vk::Extent3D(width, height, 1));
+    cmd.copyBufferToImage(staging, srcImage, vk::ImageLayout::eTransferDstOptimal, copyRegion);
+
+    vk::ImageMemoryBarrier srcToRead(
+        vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eShaderRead,
+        vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, srcImage,
+        vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eComputeShader, {}, nullptr, nullptr, srcToRead);
+
+    // Cubemap: undefined → general (the only layout storage writes are allowed in)
+    vk::ImageMemoryBarrier cubeToGeneral(
+        {}, vk::AccessFlagBits::eShaderWrite,
+        vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, envCubemap,
+        vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 6));
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+        vk::PipelineStageFlagBits::eComputeShader, {}, nullptr, nullptr, cubeToGeneral);
+
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, iblEquirectPipeline);
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, iblBakePipelineLayout,
+        0, convertSet, nullptr);
+    uint32_t groups = (faceSize + 7) / 8;  // local_size = 8x8, z = face layer
+    cmd.dispatch(groups, groups, 6);
+
+    // Cubemap: general → shader read (skybox samples in fragment, IBL bakes in compute)
+    vk::ImageMemoryBarrier cubeToRead(
+        vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eShaderRead,
+        vk::ImageLayout::eGeneral, vk::ImageLayout::eShaderReadOnlyOptimal,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, envCubemap,
+        vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 6));
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+        vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eComputeShader,
+        {}, nullptr, nullptr, cubeToRead);
+
+    cmd.end();
+    queue.submit(vk::SubmitInfo({}, {}, cmd));
+    queue.waitIdle();
+    device.freeCommandBuffers(commandPool, cmd);
+    device.freeDescriptorSets(descriptorPool, convertSet);
+
+    // Transient resources — the cubemap now holds the converted faces
+    device.destroyImageView(cubeStorageView);
+    device.destroyImageView(srcView);
+    device.destroySampler(srcSampler);
+    device.destroyImage(srcImage);
+    device.freeMemory(srcMemory);
+    device.destroyBuffer(staging);
+    device.freeMemory(stagingMem);
 
     // Update descriptor set to point to the new cubemap
     vk::DescriptorImageInfo imgInfo(envSampler, envCubemapView,
@@ -2071,7 +2207,8 @@ void Renderer::loadEnvironmentMap(vk::Device device, const std::string& hdrPath)
     envMapLoaded = true;
     namespace fs = std::filesystem;
     Log::ok("Environment map loaded: " + fs::path(hdrPath).filename().string()
-            + " (" + std::to_string(faceSize) + "x" + std::to_string(faceSize) + " per face, IBL baked)");
+            + " (" + std::to_string(faceSize) + "x" + std::to_string(faceSize)
+            + " per face, GPU-converted, IBL baked)");
 }
 
 void Renderer::createSkyboxPipeline(vk::Device device) {
@@ -2245,6 +2382,7 @@ void Renderer::createIBLResources(vk::Device device) {
     iblBrdfPipeline       = makeComputePipeline("brdf_lut.comp.spv");
     iblIrradiancePipeline = makeComputePipeline("irradiance.comp.spv");
     iblPrefilterPipeline  = makeComputePipeline("prefilter.comp.spv");
+    iblEquirectPipeline   = makeComputePipeline("equirect_to_cube.comp.spv");
 
     // ── One-time BRDF LUT bake — depends only on the BRDF, never on the HDR ──
     vk::DescriptorSetAllocateInfo allocInfo(descriptorPool, 1, &iblBakeSetLayout);
@@ -2415,6 +2553,7 @@ void Renderer::destroyIBLResources(vk::Device device) {
     if (iblBrdfPipeline)          device.destroyPipeline(iblBrdfPipeline);
     if (iblIrradiancePipeline)    device.destroyPipeline(iblIrradiancePipeline);
     if (iblPrefilterPipeline)     device.destroyPipeline(iblPrefilterPipeline);
+    if (iblEquirectPipeline)      device.destroyPipeline(iblEquirectPipeline);
     if (iblBakePipelineLayout)    device.destroyPipelineLayout(iblBakePipelineLayout);
     if (iblBakeSetLayout)         device.destroyDescriptorSetLayout(iblBakeSetLayout);
 }

@@ -1,0 +1,36 @@
+#version 450
+#include "kmrb_ibl_common.glsl"
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Equirectangular HDR → cubemap faces.
+//
+// HDR environment maps ship as a single 2:1 panorama (longitude/latitude).
+// GPUs sample environments through cubemaps, so this shader resamples the
+// panorama into 6 faces: each cube texel maps to a world direction
+// (kmrb_cubeDir), the direction maps back to panorama UV, one bilinear fetch.
+//
+// The source sampler wraps horizontally (addressModeU = repeat) so texels at
+// the atan2 seam interpolate across the wrap instead of clamping to the edge.
+// Dispatched once per HDR load by the engine (z = face layer).
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D srcEquirect;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2DArray dstCube;
+
+void main() {
+    ivec3 texel = ivec3(gl_GlobalInvocationID);
+    int faceSize = imageSize(dstCube).x;
+    if (texel.x >= faceSize || texel.y >= faceSize) return;
+
+    vec3 dir = kmrb_cubeDir(texel, faceSize);
+
+    // Direction → equirect UV. U from the azimuth; V from the elevation,
+    // flipped so the panorama's top row (v = 0) is the sky (+Y).
+    float u = atan(dir.z, dir.x) / (2.0 * KMRB_IBL_PI) + 0.5;
+    float v = 0.5 - asin(clamp(dir.y, -1.0, 1.0)) / KMRB_IBL_PI;
+
+    vec3 color = texture(srcEquirect, vec2(u, v)).rgb;
+    imageStore(dstCube, texel, vec4(color, 1.0));
+}

@@ -2,6 +2,7 @@
 
 #include <entt/entt.hpp>
 #include <glm/glm.hpp>
+#include <cmath>
 #include <vector>
 
 #include "kmrb_types.hpp"
@@ -23,6 +24,18 @@ struct Transform {
     glm::vec3 scale    = { 1.0f, 1.0f, 1.0f };
 };
 
+// Forward direction of a Transform's euler rotation (degrees), as used by
+// lights: pitch 0 / yaw 0 → -Z. Returns a unit vector. Single definition
+// shared by the light UBO packing and the gizmos, so the arrow drawn in the
+// viewport is always the direction user shaders receive.
+inline glm::vec3 lightDirectionFromEuler(const glm::vec3& rotationDeg) {
+    float pitch = glm::radians(rotationDeg.x);
+    float yaw   = glm::radians(rotationDeg.y);
+    return glm::vec3(std::cos(pitch) * std::sin(yaw),
+                     -std::sin(pitch),
+                     -std::cos(pitch) * std::cos(yaw));
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // OPTIONAL COMPONENTS (attached to define what an entity does)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -34,6 +47,12 @@ struct CameraComponent {
     float farPlane = 100.0f;
     bool active = false;
 };
+
+// Spawn pose for new camera entities — slightly above the origin, looking at
+// it. Used by scene setup and the Add Entity menu; the fly camera adopts it
+// through the renderer's per-frame entity sync.
+inline const glm::vec3 CAMERA_SPAWN_POSITION = { 0.0f, 2.0f, 5.0f };
+inline const glm::vec3 CAMERA_SPAWN_ROTATION = { -15.0f, -90.0f, 0.0f }; // pitch, yaw, roll (degrees)
 
 // Pipeline — SSBO + compute shader driven simulation
 struct PipelineComponent {
@@ -86,22 +105,5 @@ struct LightComponent {
     float spotAngle = 45.0f;  // Spot only
 };
 
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// SIMULATION
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Particle state lives entirely on the GPU (the user's init compute shader
-// fills it). The CPU side only tracks the count and provides a zeroed buffer
-// for the initial SSBO upload.
-
-class Simulation {
-public:
-    void init(uint32_t count);
-    std::vector<Particle> makeInitialSSBOData() const;
-    uint32_t getParticleCount() const { return particleCount; }
-
-private:
-    uint32_t particleCount = 0;
-};
 
 } // namespace kmrb

@@ -22,7 +22,7 @@ public:
               vk::Format swapchainFormat, vk::Extent2D extent,
               const std::vector<vk::ImageView>& swapchainImageViews,
               uint32_t graphicsQueueFamily, vk::Queue graphicsQueue,
-              uint32_t particleCount = 10000);
+              uint32_t particleCount);  // From PipelineComponent — the single source of truth
     void cleanup(vk::Device device);
 
     void onSwapchainRecreate(vk::Device device, vk::Extent2D newExtent,
@@ -32,7 +32,9 @@ public:
                    vk::Queue graphicsQueue, vk::Queue presentQueue,
                    GLFWwindow* window);
 
-    void uploadParticles(vk::Device device, const std::vector<Particle>& particles);
+    // Zero the particle SSBOs and re-run init shaders (simulation reset).
+    // Caller must device.waitIdle() first.
+    void resetParticleBuffers(vk::Device device);
     void setRegistry(entt::registry* reg) { registry = reg; }
 
     vk::RenderPass getRenderPass() const { return offscreenPass; }
@@ -56,6 +58,13 @@ public:
         for (auto& [key, inst] : shaderInstances) {
             if (inst.initPipeline) inst.initPending = true;
         }
+    }
+
+    // The particle SSBO most recently written by compute/init. The ping-pong
+    // index alternates each sim step, so read-backs and exports must ask —
+    // hardcoding "particle_b" reads one step stale half the time.
+    std::string getLatestParticleBufferName() const {
+        return pingPong == 0 ? "particle_a" : "particle_b";
     }
 
     // A single tweakable parameter extracted from shader push constants via SPIRV-Reflect.
@@ -139,6 +148,8 @@ private:
     static constexpr uint32_t IBL_PREFILTERED_SIZE = 128;  // specular map mip 0, per face
     static constexpr uint32_t IBL_PREFILTER_MIPS   = 5;    // 128 → 8, one roughness per mip
     static constexpr uint32_t IBL_BRDF_LUT_SIZE    = 512;
+    // Env cubemap face size = HDR height, capped for VRAM (1024² × 6 RGBA16F ≈ 50 MB)
+    static constexpr uint32_t ENV_CUBEMAP_MAX_FACE = 1024;
 
     vk::Image        iblIrradiance = nullptr;               // Set 1, binding 1
     vk::DeviceMemory iblIrradianceMemory = nullptr;
@@ -163,6 +174,7 @@ private:
     vk::Pipeline            iblBrdfPipeline = nullptr;
     vk::Pipeline            iblIrradiancePipeline = nullptr;
     vk::Pipeline            iblPrefilterPipeline = nullptr;
+    vk::Pipeline            iblEquirectPipeline = nullptr;  // equirect HDR → cube faces
 
     // ── Offscreen Framebuffer (simulation viewport) ──
     vk::Image offscreenColor;
@@ -196,9 +208,25 @@ private:
     uint32_t particleCount = 0;
     uint32_t pingPong = 0;
 
+    // ── Sim frame counter & frame-range export ──
+    // simFrame 0 = state right after init (or particle upload); each compute
+    // dispatch advances it by one. The UI's frame-range export records against it.
+    uint64_t simFrame = 0;
+    bool simSteppedThisFrame = false;  // Set during command recording, read after submit
+
+    bool wasRecording = false;         // Last frame's UI record flag — detects start/stop edges
+    uint32_t exportFilesWritten = 0;   // Captures in the current recording session
+    void updateFrameExport(vk::Device device);  // Called once per frame after submit
+
     // ── Command Recording ──
     vk::CommandPool commandPool;
     std::vector<vk::CommandBuffer> commandBuffers;
+
+    // Upper bound on the deltaTime handed to user simulation shaders. After a
+    // pause (window drag, breakpoint, load stall) the next frame's raw delta
+    // can be huge; integrating one giant step makes physics explode. Capping
+    // means the sim runs slower than real time below 30 fps instead.
+    static constexpr float MAX_SIM_TIMESTEP = 1.0f / 30.0f;
 
     // ── Sync ──
     static constexpr int MAX_FRAMES_IN_FLIGHT = 2;
@@ -216,9 +244,10 @@ private:
     float computeTime = 0.0f;
 
     // ── Frame timing & periodic work (members, not function statics) ──
+    static constexpr float HOT_RELOAD_POLL_SEC = 0.5f;    // Shader file mtime poll interval
     std::chrono::steady_clock::time_point appStartTime;   // For the shader 'time' uniform
     std::chrono::steady_clock::time_point lastFrameTime;  // For real per-frame delta
-    uint32_t hotReloadCounter = 0;   // Frames since the last shader file poll
+    float hotReloadTimer = 0.0f;     // Seconds since the last shader file poll
     bool firstSyncDone = false;      // Initial shader/mesh instance sync happened
 
 
@@ -256,6 +285,7 @@ private:
     void createDescriptorPool(vk::Device device);
     void createDescriptorSets(vk::Device device);
     void createParticleBuffer(vk::Device device);
+    void writeParticleDescriptors(vk::Device device);  // Ping-pong set ↔ buffer wiring
     void createCommandPool(vk::Device device, uint32_t queueFamily);
     void createCommandBuffers(vk::Device device);
     void createSyncObjects(vk::Device device);

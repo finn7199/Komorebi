@@ -1,0 +1,62 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+// ── Global UBO (read-only, provided by engine) ──
+layout(set = 0, binding = 0) uniform GlobalUBO {
+    mat4 view;
+    mat4 proj;
+    vec4 cameraPos;
+    float time;
+    float deltaTime;
+} global;
+
+// ── Environment Map (optional, set in Scene > Environment) ──
+// Cubemap sampler bound by the engine. Returns black if no HDR is loaded.
+// layout(set = 1, binding = 0) uniform samplerCube envMap;
+
+// ── Push Constants (tweakable in Inspector) ──
+// SPIRV-Reflect auto-generates sliders for each parameter.
+//
+// RULES:
+//   1. 'model' (mat4) and 'color' (vec4) are ENGINE BUILT-INS.
+//      They MUST be first, in this order. Do NOT remove them.
+//   2. Add your own params AFTER color. They appear as live controls.
+//   3. Max 128 bytes total. model(64) + color(16) = 80 used,
+//      leaving 48 bytes for your params.
+//   4. Supported types: float, vec2, vec3, vec4, int, bool
+//
+layout(push_constant) uniform Params {
+    mat4 model;         // Engine built-in (do not remove)
+    vec4 color;         // Engine built-in (do not remove)
+
+    // ── Your parameters below ──
+    // float myParam;   // Example: uncomment and use in main()
+} params;
+
+// ── Particle SSBO (ping-pong double-buffered) ──
+struct Particle {
+    vec4 position;  // xyz = pos, w = point size
+    vec4 velocity;  // xyz = vel, w = lifetime
+    vec4 color;     // rgba
+};
+
+layout(set = 2, binding = 0) readonly buffer ParticleInput {
+    Particle particles[];
+} ssboIn;
+
+layout(set = 2, binding = 1) writeonly buffer ParticleOutput {
+    Particle particles[];
+} ssboOut;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= ssboIn.particles.length()) return;
+
+    Particle p = ssboIn.particles[index];
+    float dt = global.deltaTime;
+
+    // Your simulation here
+
+    ssboOut.particles[index] = p;
+}

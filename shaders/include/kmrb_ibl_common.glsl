@@ -17,9 +17,9 @@
 const float KMRB_IBL_PI = 3.14159265359;
 
 // Map a cubemap texel (x, y, face) to its world-space direction.
-// MUST match the CPU-side equirect→cube conversion in kmrb_renderer.cpp
-// (loadEnvironmentMap) — same face order and orientation, or the baked maps
-// would be rotated relative to the skybox.
+// Every shader that writes cube faces shares this mapping — including
+// equirect_to_cube.comp, which builds the env cubemap itself — so the skybox
+// and the baked IBL maps can never rotate out of agreement.
 // face 0: +X, 1: -X, 2: +Y, 3: -Y, 4: +Z, 5: -Z
 vec3 kmrb_cubeDir(ivec3 texel, int faceSize) {
     // Texel center → [-1, 1] on the face plane

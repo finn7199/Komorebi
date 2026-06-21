@@ -15,14 +15,13 @@ void Core::init() {
     createSwapchain();
     createImageViews();
 
-    // Particle state is GPU-resident — the sim only tracks the count
-    sim.init(10000);
-
-    // Scene entities — every entity gets Name + Transform, then optional components
+    // Scene entities — every entity gets Name + Transform, then optional components.
+    // PipelineComponent owns the particle count (its struct default is the one
+    // place the number lives); everything else derives from it.
     auto pipeline = registry.create();
     registry.emplace<Name>(pipeline, "Pipeline");
     registry.emplace<Transform>(pipeline);
-    registry.emplace<PipelineComponent>(pipeline, PipelineComponent{10000});
+    registry.emplace<PipelineComponent>(pipeline);
     registry.emplace<ShaderProgramComponent>(pipeline, ShaderProgramComponent{
         KMRB_SHADER_DIR "/compute/default_init.comp",
         KMRB_SHADER_DIR "/compute/gravity.comp",
@@ -34,8 +33,8 @@ void Core::init() {
     auto cam = registry.create();
     registry.emplace<Name>(cam, "Main Camera");
     registry.emplace<Transform>(cam, Transform{
-        {0.0f, 2.0f, 5.0f}, {-15.0f, -90.0f, 0.0f}, {1.0f, 1.0f, 1.0f}});
-    registry.emplace<CameraComponent>(cam, CameraComponent{45.0f, 0.1f, 100.0f, true});
+        CAMERA_SPAWN_POSITION, CAMERA_SPAWN_ROTATION, {1.0f, 1.0f, 1.0f}});
+    registry.emplace<CameraComponent>(cam).active = true;  // FOV/planes = component defaults
 
 
     auto grid = registry.create();
@@ -47,29 +46,20 @@ void Core::init() {
     renderer.init(window, instance, device, physicalDevice,
                   swapchainImageFormat, swapchainExtent,
                   swapchainImageViews, indices.graphicsFamily.value(),
-                  graphicsQueue, sim.getParticleCount());
-
-    // Upload zeroed particle buffer — the init compute shader fills it on the GPU
-    auto particles = sim.makeInitialSSBOData();
-    renderer.uploadParticles(device, particles);
+                  graphicsQueue, registry.get<PipelineComponent>(pipeline).particleCount);
 
     // Wire up UI callbacks
     renderer.getUI().setProjectRoot(KMRB_SHADER_DIR "/..");  // Points to repo root
     renderer.getUI().setOnReset([this]() {
         device.waitIdle();
         // Zero the SSBOs and re-run the init shader — particles live on the GPU
-        auto particles = sim.makeInitialSSBOData();
-        renderer.uploadParticles(device, particles);
-        renderer.requestInitDispatch();  // Re-run init shaders if assigned
+        renderer.resetParticleBuffers(device);
         kmrb::Log::ok("Simulation reset");
     });
     renderer.getUI().setOnExportCSV([this](const std::string& path) {
         device.waitIdle();
-        renderer.getBufferManager().exportToCSV("particle_b", path, {
-            "pos.x", "pos.y", "pos.z", "size",
-            "vel.x", "vel.y", "vel.z", "lifetime",
-            "r", "g", "b", "a"
-        });
+        renderer.getBufferManager().exportToCSV(
+            renderer.getLatestParticleBufferName(), path, particleCSVColumns());
     });
     renderer.getUI().setOnReloadShaders([this]() {
         device.waitIdle();

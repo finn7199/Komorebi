@@ -54,7 +54,6 @@ private:
 
     // ── ECS ──
     entt::registry registry;
-    Simulation sim;
 
     // Device extensions we require
     const std::vector<const char*> deviceExtensions = {

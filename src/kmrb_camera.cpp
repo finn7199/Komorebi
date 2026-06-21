@@ -5,12 +5,6 @@
 
 namespace kmrb {
 
-void Camera::init(const glm::vec3& pos, float p, float y) {
-    position = pos;
-    pitch = p;
-    yaw = y;
-}
-
 void Camera::update(GLFWwindow* window, float deltaTime) {
     isUserControlling = false;
 

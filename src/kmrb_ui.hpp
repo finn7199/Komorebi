@@ -73,11 +73,20 @@ public:
     float getCameraLookSensitivity() const { return cameraLookSensitivity; }
     int getRenderWidth() const { return renderWidth; }
     int getRenderHeight() const { return renderHeight; }
-    int getParticleCount() const { return particleCount; }
     bool isRenderResolutionDirty() { bool d = renderResDirty; renderResDirty = false; return d; }
-    bool isParticleCountDirty() { bool d = particleCountDirty; particleCountDirty = false; return d; }
     bool getShowGizmos() const { return showGizmos; }
     entt::entity getSelectedEntity() const { return selectedEntity; }
+
+    // ── Recording (frame export) ──
+    // The Export tab's record toggle is the whole interface; the renderer polls
+    // it each frame and captures every sim step while it's on.
+    bool isRecording() const { return recordingActive; }
+    const std::string& getExportPath() const { return exportPath; }
+    // Written by the renderer so the Export tab can display live status
+    void setSimFrame(uint64_t f) { simFrame = f; }
+    void setRecordedFrameCount(uint32_t n) { recordedFrames = n; }
+    // Ping-pong-aware: which particle SSBO holds the latest sim state
+    void setLatestParticleBuffer(const std::string& name) { latestParticleBuffer = name; }
 
     // Handle swapchain recreation
     void onSwapchainRecreate(uint32_t newImageCount);
@@ -121,22 +130,22 @@ private:
     bool renderResDirty = false;
     float cameraMoveSpeed = 5.0f;
     float cameraLookSensitivity = 0.15f;
-    int particleCount = 10000;
-    bool particleCountDirty = false;
 
     // Environment map — scene-level property
     std::string envMapPath;
 
     // Data Output panel state
     BufferManager* bufferManager = nullptr;
+    std::string latestParticleBuffer = "particle_b";  // Updated by renderer each frame
     std::vector<float> cachedParticleData;   // Last SSBO read-back
     float dataRefreshInterval = 0.5f;        // Seconds between refreshes
     float dataRefreshTimer = 0.0f;
     uint32_t cachedElementCount = 0;
     bool dataAutoRefresh = true;
     std::string exportPath;
-    int exportFrameStart = 0;
-    int exportFrameEnd = 0;
+    bool recordingActive = false;    // Record toggle — renderer captures sim steps while true
+    uint32_t recordedFrames = 0;     // Mirrored from the renderer for display
+    uint64_t simFrame = 0;           // Mirrored from the renderer for display
 
     // Scene hierarchy state
     entt::registry* registry = nullptr;

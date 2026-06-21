@@ -1,0 +1,80 @@
+#version 450
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INIT SHADER — runs ONCE to set up particle positions, velocities, colors.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// This shader dispatches once when:
+//   - A Pipeline entity is first created
+//   - The simulation is reset (Simulation > Restart)
+//   - The init shader file is modified (hot-reload)
+//
+// Drag this file onto the "Init" slot in the Pipeline Inspector.
+// It writes to ssboOut — the same buffer that the compute shader reads from.
+//
+// EXAMPLES:
+//   Random sphere:  scatter particles on a sphere surface
+//   Grid:           place particles in a uniform 3D grid
+//   Custom shapes:  5 clusters, a ring, a cube outline, etc.
+//   Single object:  one particle at a specific location
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+layout(local_size_x = 256) in;
+
+// ── Global UBO (read-only, provided by engine) ──
+layout(set = 0, binding = 0) uniform GlobalUBO {
+    mat4 view;
+    mat4 proj;
+    vec4 cameraPos;
+    float time;
+    float deltaTime;
+} global;
+
+// ── Particle SSBO ──
+struct Particle {
+    vec4 position;  // xyz = pos, w = point size
+    vec4 velocity;  // xyz = vel, w = lifetime
+    vec4 color;     // rgba
+};
+
+layout(set = 2, binding = 0) readonly buffer ParticleInput {
+    Particle particles[];
+} ssboIn;
+
+layout(set = 2, binding = 1) writeonly buffer ParticleOutput {
+    Particle particles[];
+} ssboOut;
+
+// ── Simple hash for pseudo-random numbers from particle index ──
+float hash(uint n) {
+    n = (n << 13u) ^ n;
+    n = n * (n * n * 15731u + 789221u) + 1376312589u;
+    return float(n & 0x7fffffffu) / float(0x7fffffff);
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= ssboIn.particles.length()) return;
+
+    Particle p;
+
+    // ── Random sphere distribution (replace with your own logic) ──
+    float r1 = hash(index * 3u + 0u);      // 0 to 1
+    float r2 = hash(index * 3u + 1u);      // 0 to 1
+    float r3 = hash(index * 3u + 2u);      // 0 to 1
+
+    float theta = r1 * 6.28318;            // Azimuth: 0 to 2*pi
+    float phi = acos(1.0 - 2.0 * r2);     // Polar: uniform on sphere
+    float radius = 2.0 * pow(r3, 0.333);  // Cube root for volume fill
+
+    p.position.xyz = vec3(
+        radius * sin(phi) * cos(theta),
+        radius * sin(phi) * sin(theta),
+        radius * cos(phi)
+    );
+    p.position.w = 2.0;                    // Point size
+
+    p.velocity = vec4(0.0);                // Start at rest
+    p.color = vec4(1.0, 0.9, 0.7, 1.0);   // Warm white
+
+    ssboOut.particles[index] = p;
+}

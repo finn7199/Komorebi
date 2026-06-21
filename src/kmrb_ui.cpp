@@ -1,9 +1,11 @@
 #include "kmrb_ui.hpp"
 #include "kmrb_buffers.hpp"
+#include "kmrb_palette.hpp"
 #include "kmrb_sim.hpp"
 #include "kmrb_renderer.hpp"  // For ShaderInstance / ReflectedParam types in Inspector
 #define GLFW_EXPOSE_NATIVE_WIN32
-#include <GLFW/glfw3native.h>
+#include <GLFW/glfw3native.h>   // Pulls in <windows.h>
+#include <shellapi.h>           // ShellExecuteA
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
@@ -14,6 +16,30 @@
 #include <cstring>
 
 namespace kmrb {
+
+// Open a file with its associated application (VS Code, image viewer, ...).
+// ShellExecuteA is async and handle-free — unlike _popen("start ...") which
+// leaks a FILE*, or system() which blocks the render thread on a shell.
+static void openInSystemEditor(const std::string& path) {
+    ShellExecuteA(nullptr, "open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// Human-readable label for a mesh entity's geometry source — shown in the Inspector
+// and the Data Output asset list. Primitives display by name; files by filename.
+static std::string meshDisplayLabel(const std::string& meshPath) {
+    if (meshPath.empty())             return "(no mesh)";
+    if (meshPath == PRIMITIVE_CUBE)   return "Cube";
+    if (meshPath == PRIMITIVE_SPHERE) return "Sphere";
+    return std::filesystem::path(meshPath).filename().string();
+}
+
+// Reveal a file in Windows Explorer (selects it in its folder)
+static void showInExplorer(const std::string& path) {
+    std::string winPath = path;
+    std::replace(winPath.begin(), winPath.end(), '/', '\\');  // Explorer wants backslashes
+    std::string args = "/select,\"" + winPath + "\"";
+    ShellExecuteA(nullptr, "open", "explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+}
 
 // Convert hex color #RRGGBB to ImVec4 (0-1 range)
 static ImVec4 hex(uint32_t rgb, float a = 1.0f) {
@@ -54,78 +80,108 @@ static void applyKMRBTheme() {
     s.WindowTitleAlign  = ImVec2(0.5f, 0.5f);
 
     // ── Backgrounds ──
-    s.Colors[ImGuiCol_WindowBg]           = hex(0x0E0D0B, 0.94f);
-    s.Colors[ImGuiCol_ChildBg]            = hex(0x1A1714);
-    s.Colors[ImGuiCol_PopupBg]            = hex(0x1A1714);
-    s.Colors[ImGuiCol_TitleBg]            = hex(0x252017);
-    s.Colors[ImGuiCol_TitleBgActive]      = hex(0x30291E);
-    s.Colors[ImGuiCol_TitleBgCollapsed]   = hex(0x1A1714);
-    s.Colors[ImGuiCol_MenuBarBg]          = hex(0x252017);
-    s.Colors[ImGuiCol_ScrollbarBg]        = hex(0x0E0D0B);
+    s.Colors[ImGuiCol_WindowBg]           = hex(palette::Base, 0.94f);
+    s.Colors[ImGuiCol_ChildBg]            = hex(palette::Panel);
+    s.Colors[ImGuiCol_PopupBg]            = hex(palette::Panel);
+    s.Colors[ImGuiCol_TitleBg]            = hex(palette::Raised);
+    s.Colors[ImGuiCol_TitleBgActive]      = hex(palette::Hover);
+    s.Colors[ImGuiCol_TitleBgCollapsed]   = hex(palette::Panel);
+    s.Colors[ImGuiCol_MenuBarBg]          = hex(palette::Raised);
+    s.Colors[ImGuiCol_ScrollbarBg]        = hex(palette::Base);
 
     // ── Tab ──
-    s.Colors[ImGuiCol_Tab]                = hex(0x252017);
-    s.Colors[ImGuiCol_TabSelected]        = hex(0x30291E);
-    s.Colors[ImGuiCol_TabHovered]         = hex(0x3D352A);
-    s.Colors[ImGuiCol_TabDimmed]          = hex(0x1A1714);
-    s.Colors[ImGuiCol_TabDimmedSelected]  = hex(0x252017);
-    s.Colors[ImGuiCol_TabSelectedOverline]= hex(0xC8A44E);
+    s.Colors[ImGuiCol_Tab]                = hex(palette::Raised);
+    s.Colors[ImGuiCol_TabSelected]        = hex(palette::Hover);
+    s.Colors[ImGuiCol_TabHovered]         = hex(palette::Border);
+    s.Colors[ImGuiCol_TabDimmed]          = hex(palette::Panel);
+    s.Colors[ImGuiCol_TabDimmedSelected]  = hex(palette::Raised);
+    s.Colors[ImGuiCol_TabSelectedOverline]= hex(palette::Gold);
 
     // ── Headers ──
-    s.Colors[ImGuiCol_Header]             = hex(0x252017);
-    s.Colors[ImGuiCol_HeaderHovered]      = hex(0x30291E);
-    s.Colors[ImGuiCol_HeaderActive]       = hex(0x3D352A);
+    s.Colors[ImGuiCol_Header]             = hex(palette::Raised);
+    s.Colors[ImGuiCol_HeaderHovered]      = hex(palette::Hover);
+    s.Colors[ImGuiCol_HeaderActive]       = hex(palette::Border);
 
     // ── Buttons ──
-    s.Colors[ImGuiCol_Button]             = hex(0x252017);
-    s.Colors[ImGuiCol_ButtonHovered]      = hex(0x30291E);
-    s.Colors[ImGuiCol_ButtonActive]       = hex(0x3D352A);
+    s.Colors[ImGuiCol_Button]             = hex(palette::Raised);
+    s.Colors[ImGuiCol_ButtonHovered]      = hex(palette::Hover);
+    s.Colors[ImGuiCol_ButtonActive]       = hex(palette::Border);
 
     // ── Frame (input fields, slider bg) ──
-    s.Colors[ImGuiCol_FrameBg]            = hex(0x1A1714);
-    s.Colors[ImGuiCol_FrameBgHovered]     = hex(0x252017);
-    s.Colors[ImGuiCol_FrameBgActive]      = hex(0x30291E);
+    s.Colors[ImGuiCol_FrameBg]            = hex(palette::Panel);
+    s.Colors[ImGuiCol_FrameBgHovered]     = hex(palette::Raised);
+    s.Colors[ImGuiCol_FrameBgActive]      = hex(palette::Hover);
 
     // ── Scrollbar ──
-    s.Colors[ImGuiCol_ScrollbarGrab]         = hex(0x3D352A);
-    s.Colors[ImGuiCol_ScrollbarGrabHovered]  = hex(0x5C5347);
-    s.Colors[ImGuiCol_ScrollbarGrabActive]   = hex(0x8B7D6B);
+    s.Colors[ImGuiCol_ScrollbarGrab]         = hex(palette::Border);
+    s.Colors[ImGuiCol_ScrollbarGrabHovered]  = hex(palette::TextDim);
+    s.Colors[ImGuiCol_ScrollbarGrabActive]   = hex(palette::TextMuted);
 
     // ── God ray accents (golden) ──
-    s.Colors[ImGuiCol_SliderGrab]         = hex(0xC8A44E);
-    s.Colors[ImGuiCol_SliderGrabActive]   = hex(0xE2C36B);
-    s.Colors[ImGuiCol_CheckMark]          = hex(0xC8A44E);
-    s.Colors[ImGuiCol_PlotLines]          = hex(0xC8A44E);
-    s.Colors[ImGuiCol_PlotHistogram]      = hex(0xC8A44E);
-    s.Colors[ImGuiCol_TextSelectedBg]     = hex(0x2E2210);
-    s.Colors[ImGuiCol_NavHighlight]       = hex(0xC8A44E);
+    s.Colors[ImGuiCol_SliderGrab]         = hex(palette::Gold);
+    s.Colors[ImGuiCol_SliderGrabActive]   = hex(palette::GoldBright);
+    s.Colors[ImGuiCol_CheckMark]          = hex(palette::Gold);
+    s.Colors[ImGuiCol_PlotLines]          = hex(palette::Gold);
+    s.Colors[ImGuiCol_PlotHistogram]      = hex(palette::Gold);
+    s.Colors[ImGuiCol_TextSelectedBg]     = hex(palette::GoldSelection);
+    s.Colors[ImGuiCol_NavHighlight]       = hex(palette::Gold);
 
     // ── Separators ──
-    s.Colors[ImGuiCol_Separator]          = hex(0x3D352A);
-    s.Colors[ImGuiCol_SeparatorHovered]   = hex(0x7A5F28);
-    s.Colors[ImGuiCol_SeparatorActive]    = hex(0xC8A44E);
+    s.Colors[ImGuiCol_Separator]          = hex(palette::Border);
+    s.Colors[ImGuiCol_SeparatorHovered]   = hex(palette::GoldDim);
+    s.Colors[ImGuiCol_SeparatorActive]    = hex(palette::Gold);
 
     // ── Resize grips ──
-    s.Colors[ImGuiCol_ResizeGrip]         = hex(0x4A3818);
-    s.Colors[ImGuiCol_ResizeGripHovered]  = hex(0x7A5F28);
-    s.Colors[ImGuiCol_ResizeGripActive]   = hex(0xC8A44E);
+    s.Colors[ImGuiCol_ResizeGrip]         = hex(palette::GoldFaint);
+    s.Colors[ImGuiCol_ResizeGripHovered]  = hex(palette::GoldDim);
+    s.Colors[ImGuiCol_ResizeGripActive]   = hex(palette::Gold);
 
     // ── Borders ──
-    s.Colors[ImGuiCol_Border]             = hex(0x3D352A);
-    s.Colors[ImGuiCol_BorderShadow]       = hex(0x000000, 0.0f);
-    s.Colors[ImGuiCol_TableBorderStrong]  = hex(0x3D352A);
-    s.Colors[ImGuiCol_TableBorderLight]   = hex(0x252017);
-    s.Colors[ImGuiCol_TableHeaderBg]      = hex(0x252017);
-    s.Colors[ImGuiCol_TableRowBg]         = hex(0x000000, 0.0f);
-    s.Colors[ImGuiCol_TableRowBgAlt]      = hex(0x1A1714);
+    s.Colors[ImGuiCol_Border]             = hex(palette::Border);
+    s.Colors[ImGuiCol_BorderShadow]       = hex(palette::Black, 0.0f);
+    s.Colors[ImGuiCol_TableBorderStrong]  = hex(palette::Border);
+    s.Colors[ImGuiCol_TableBorderLight]   = hex(palette::Raised);
+    s.Colors[ImGuiCol_TableHeaderBg]      = hex(palette::Raised);
+    s.Colors[ImGuiCol_TableRowBg]         = hex(palette::Black, 0.0f);
+    s.Colors[ImGuiCol_TableRowBgAlt]      = hex(palette::Panel);
 
     // ── Text ──
-    s.Colors[ImGuiCol_Text]               = hex(0xE8DCC8);
-    s.Colors[ImGuiCol_TextDisabled]       = hex(0x5C5347);
+    s.Colors[ImGuiCol_Text]               = hex(palette::Text);
+    s.Colors[ImGuiCol_TextDisabled]       = hex(palette::TextDim);
 
     // ── Docking ──
-    s.Colors[ImGuiCol_DockingPreview]     = hex(0xC8A44E, 0.4f);
-    s.Colors[ImGuiCol_DockingEmptyBg]     = hex(0x0E0D0B);
+    s.Colors[ImGuiCol_DockingPreview]     = hex(palette::Gold, 0.4f);
+    s.Colors[ImGuiCol_DockingEmptyBg]     = hex(palette::Base);
+}
+
+// Create a new shader in the project by copying an engine template from
+// shaders/templates/ — plain GLSL files users can read and edit, instead of
+// string literals buried in C++. Picks a unique name: base.ext, base_1.ext, ...
+static void createShaderFromTemplate(const std::string& projectRoot,
+                                     const char* templateName,
+                                     const char* destSubdir,
+                                     const char* baseName) {
+    namespace fs = std::filesystem;
+    if (projectRoot.empty()) return;
+
+    fs::path templatePath = fs::path(KMRB_SHADER_DIR) / "templates" / templateName;
+    if (!fs::exists(templatePath)) {
+        kmrb::Log::error("Shader template missing: " + templatePath.generic_string());
+        return;
+    }
+
+    std::string destDir = projectRoot + destSubdir;
+    fs::create_directories(destDir);
+
+    std::string ext = fs::path(templateName).extension().string();
+    std::string name = std::string(baseName) + ext;
+    int n = 1;
+    while (fs::exists(destDir + "/" + name)) {
+        name = std::string(baseName) + "_" + std::to_string(n++) + ext;
+    }
+
+    fs::copy_file(templatePath, destDir + "/" + name);
+    kmrb::Log::ok("Created shader: " + name);
 }
 
 void UI::init(GLFWwindow* window, vk::Instance instance, vk::PhysicalDevice physicalDevice,
@@ -237,7 +293,7 @@ void UI::drawMenuBar() {
                     }
                     if (ImGui::IsItemHovered()) {
                         ImGui::BeginTooltip();
-                        ImGui::TextColored(hex(0x8B7D6B), "%s", scene.c_str());
+                        ImGui::TextColored(hex(palette::TextMuted), "%s", scene.c_str());
                         ImGui::EndTooltip();
                     }
                 }
@@ -250,234 +306,22 @@ void UI::drawMenuBar() {
 
             ImGui::Separator();
 
+            // "New X Shader" — copies an engine template (shaders/templates/)
+            // into the project; templates are editable GLSL files on disk
             if (ImGui::MenuItem("New Init Shader")) {
-                if (!projectRoot.empty()) {
-                    namespace fs = std::filesystem;
-                    std::string shadersDir = projectRoot + "/shaders/compute";
-                    fs::create_directories(shadersDir);
-
-                    std::string name = "init.comp";
-                    int n = 1;
-                    while (fs::exists(shadersDir + "/" + name)) {
-                        name = "init_" + std::to_string(n++) + ".comp";
-                    }
-
-                    std::string path = shadersDir + "/" + name;
-                    std::ofstream f(path);
-                    f << "#version 450\n\n"
-                      << "// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                      << "// INIT SHADER — runs ONCE to set up particle positions, velocities, colors.\n"
-                      << "// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                      << "// This shader dispatches once when:\n"
-                      << "//   - A Pipeline entity is first created\n"
-                      << "//   - The simulation is reset (Simulation > Restart)\n"
-                      << "//   - The init shader file is modified (hot-reload)\n"
-                      << "//\n"
-                      << "// Drag this file onto the \"Init\" slot in the Pipeline Inspector.\n"
-                      << "// It writes to ssboOut — the same buffer that the compute shader reads from.\n"
-                      << "//\n"
-                      << "// EXAMPLES:\n"
-                      << "//   Random sphere:  scatter particles on a sphere surface\n"
-                      << "//   Grid:           place particles in a uniform 3D grid\n"
-                      << "//   Custom shapes:  5 clusters, a ring, a cube outline, etc.\n"
-                      << "//   Single object:  one particle at a specific location\n"
-                      << "// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                      << "layout(local_size_x = 256) in;\n\n"
-                      << "// ── Global UBO (read-only, provided by engine) ──\n"
-                      << "layout(set = 0, binding = 0) uniform GlobalUBO {\n"
-                      << "    mat4 view;\n    mat4 proj;\n    vec4 cameraPos;\n"
-                      << "    float time;\n    float deltaTime;\n} global;\n\n"
-                      << "// ── Particle SSBO ──\n"
-                      << "struct Particle {\n"
-                      << "    vec4 position;  // xyz = pos, w = point size\n"
-                      << "    vec4 velocity;  // xyz = vel, w = lifetime\n"
-                      << "    vec4 color;     // rgba\n"
-                      << "};\n\n"
-                      << "layout(set = 2, binding = 0) readonly buffer ParticleInput {\n"
-                      << "    Particle particles[];\n} ssboIn;\n\n"
-                      << "layout(set = 2, binding = 1) writeonly buffer ParticleOutput {\n"
-                      << "    Particle particles[];\n} ssboOut;\n\n"
-                      << "// ── Simple hash for pseudo-random numbers from particle index ──\n"
-                      << "float hash(uint n) {\n"
-                      << "    n = (n << 13u) ^ n;\n"
-                      << "    n = n * (n * n * 15731u + 789221u) + 1376312589u;\n"
-                      << "    return float(n & 0x7fffffffu) / float(0x7fffffff);\n"
-                      << "}\n\n"
-                      << "void main() {\n"
-                      << "    uint index = gl_GlobalInvocationID.x;\n"
-                      << "    if (index >= ssboIn.particles.length()) return;\n\n"
-                      << "    Particle p;\n\n"
-                      << "    // ── Random sphere distribution (replace with your own logic) ──\n"
-                      << "    float r1 = hash(index * 3u + 0u);      // 0 to 1\n"
-                      << "    float r2 = hash(index * 3u + 1u);      // 0 to 1\n"
-                      << "    float r3 = hash(index * 3u + 2u);      // 0 to 1\n\n"
-                      << "    float theta = r1 * 6.28318;            // Azimuth: 0 to 2*pi\n"
-                      << "    float phi = acos(1.0 - 2.0 * r2);     // Polar: uniform on sphere\n"
-                      << "    float radius = 2.0 * pow(r3, 0.333);  // Cube root for volume fill\n\n"
-                      << "    p.position.xyz = vec3(\n"
-                      << "        radius * sin(phi) * cos(theta),\n"
-                      << "        radius * sin(phi) * sin(theta),\n"
-                      << "        radius * cos(phi)\n"
-                      << "    );\n"
-                      << "    p.position.w = 2.0;                    // Point size\n\n"
-                      << "    p.velocity = vec4(0.0);                // Start at rest\n"
-                      << "    p.color = vec4(1.0, 0.9, 0.7, 1.0);   // Warm white\n\n"
-                      << "    ssboOut.particles[index] = p;\n}\n";
-                    f.close();
-                    kmrb::Log::ok("Created shader: " + name);
-                }
+                createShaderFromTemplate(projectRoot, "init.comp", "/shaders/compute", "init");
             }
 
             if (ImGui::MenuItem("New Compute Shader")) {
-                if (!projectRoot.empty()) {
-                    namespace fs = std::filesystem;
-                    std::string shadersDir = projectRoot + "/shaders/compute";
-                    fs::create_directories(shadersDir);
-
-                    std::string name = "custom.comp";
-                    int n = 1;
-                    while (fs::exists(shadersDir + "/" + name)) {
-                        name = "custom_" + std::to_string(n++) + ".comp";
-                    }
-
-                    std::string path = shadersDir + "/" + name;
-                    std::ofstream f(path);
-                    f << "#version 450\n\n"
-                      << "layout(local_size_x = 256) in;\n\n"
-                      << "// ── Global UBO (read-only, provided by engine) ──\n"
-                      << "layout(set = 0, binding = 0) uniform GlobalUBO {\n"
-                      << "    mat4 view;\n    mat4 proj;\n    vec4 cameraPos;\n"
-                      << "    float time;\n    float deltaTime;\n} global;\n\n"
-                      << "// ── Environment Map (optional, set in Scene > Environment) ──\n"
-                      << "// Cubemap sampler bound by the engine. Returns black if no HDR is loaded.\n"
-                      << "// layout(set = 1, binding = 0) uniform samplerCube envMap;\n\n"
-                      << "// ── Push Constants (tweakable in Inspector) ──\n"
-                      << "// SPIRV-Reflect auto-generates sliders for each parameter.\n"
-                      << "//\n"
-                      << "// RULES:\n"
-                      << "//   1. 'model' (mat4) and 'color' (vec4) are ENGINE BUILT-INS.\n"
-                      << "//      They MUST be first, in this order. Do NOT remove them.\n"
-                      << "//   2. Add your own params AFTER color. They appear as live controls.\n"
-                      << "//   3. Max 128 bytes total. model(64) + color(16) = 80 used,\n"
-                      << "//      leaving 48 bytes for your params.\n"
-                      << "//   4. Supported types: float, vec2, vec3, vec4, int, bool\n"
-                      << "//\n"
-                      << "layout(push_constant) uniform Params {\n"
-                      << "    mat4 model;         // Engine built-in (do not remove)\n"
-                      << "    vec4 color;         // Engine built-in (do not remove)\n\n"
-                      << "    // ── Your parameters below ──\n"
-                      << "    // float myParam;   // Example: uncomment and use in main()\n"
-                      << "} params;\n\n"
-                      << "// ── Particle SSBO (ping-pong double-buffered) ──\n"
-                      << "struct Particle {\n"
-                      << "    vec4 position;  // xyz = pos, w = point size\n"
-                      << "    vec4 velocity;  // xyz = vel, w = lifetime\n"
-                      << "    vec4 color;     // rgba\n"
-                      << "};\n\n"
-                      << "layout(set = 2, binding = 0) readonly buffer ParticleInput {\n"
-                      << "    Particle particles[];\n} ssboIn;\n\n"
-                      << "layout(set = 2, binding = 1) writeonly buffer ParticleOutput {\n"
-                      << "    Particle particles[];\n} ssboOut;\n\n"
-                      << "void main() {\n"
-                      << "    uint index = gl_GlobalInvocationID.x;\n"
-                      << "    if (index >= ssboIn.particles.length()) return;\n\n"
-                      << "    Particle p = ssboIn.particles[index];\n"
-                      << "    float dt = global.deltaTime;\n\n"
-                      << "    // Your simulation here\n\n"
-                      << "    ssboOut.particles[index] = p;\n}\n";
-                    f.close();
-                    kmrb::Log::ok("Created shader: " + name);
-                }
+                createShaderFromTemplate(projectRoot, "compute.comp", "/shaders/compute", "custom");
             }
 
             if (ImGui::MenuItem("New Vertex Shader")) {
-                if (!projectRoot.empty()) {
-                    namespace fs = std::filesystem;
-                    std::string shadersDir = projectRoot + "/shaders/render";
-                    fs::create_directories(shadersDir);
-
-                    std::string name = "custom.vert";
-                    int n = 1;
-                    while (fs::exists(shadersDir + "/" + name)) {
-                        name = "custom_" + std::to_string(n++) + ".vert";
-                    }
-
-                    std::string path = shadersDir + "/" + name;
-                    std::ofstream f(path);
-                    f << "#version 450\n\n"
-                      << "// ── Global UBO (read-only, provided by engine) ──\n"
-                      << "layout(set = 0, binding = 0) uniform GlobalUBO {\n"
-                      << "    mat4 view;\n    mat4 proj;\n    vec4 cameraPos;\n"
-                      << "    float time;\n    float deltaTime;\n} global;\n\n"
-                      << "// ── Push Constants ──\n"
-                      << "// Must match the compute shader's push constant layout.\n"
-                      << "layout(push_constant) uniform PushConstants {\n"
-                      << "    mat4 model;\n"
-                      << "    vec4 color;\n"
-                      << "} push;\n\n"
-                      << "// ── Particle SSBO ──\n"
-                      << "// Binding 1 = the output buffer that compute just wrote to.\n"
-                      << "struct Particle {\n"
-                      << "    vec4 position;  // xyz = pos, w = point size\n"
-                      << "    vec4 velocity;  // xyz = vel, w = lifetime\n"
-                      << "    vec4 color;     // rgba\n"
-                      << "};\n\n"
-                      << "layout(set = 2, binding = 1) readonly buffer ParticleSSBO {\n"
-                      << "    Particle particles[];\n} ssbo;\n\n"
-                      << "// ── Outputs to fragment shader ──\n"
-                      << "layout(location = 0) out vec3 fragColor;\n\n"
-                      << "void main() {\n"
-                      << "    Particle p = ssbo.particles[gl_VertexIndex];\n\n"
-                      << "    vec4 worldPos = push.model * vec4(p.position.xyz, 1.0);\n"
-                      << "    gl_Position = global.proj * global.view * worldPos;\n"
-                      << "    gl_PointSize = max(p.position.w, 1.0);\n\n"
-                      << "    fragColor = p.color.rgb * push.color.rgb;\n}\n";
-                    f.close();
-                    kmrb::Log::ok("Created shader: " + name);
-                }
+                createShaderFromTemplate(projectRoot, "particle.vert", "/shaders/render", "custom");
             }
 
             if (ImGui::MenuItem("New Fragment Shader")) {
-                if (!projectRoot.empty()) {
-                    namespace fs = std::filesystem;
-                    std::string shadersDir = projectRoot + "/shaders/render";
-                    fs::create_directories(shadersDir);
-
-                    std::string name = "custom.frag";
-                    int n = 1;
-                    while (fs::exists(shadersDir + "/" + name)) {
-                        name = "custom_" + std::to_string(n++) + ".frag";
-                    }
-
-                    std::string path = shadersDir + "/" + name;
-                    std::ofstream f(path);
-                    f << "#version 450\n\n"
-                      << "// ── Environment Map (optional, set in Scene > Environment) ──\n"
-                      << "// Cubemap sampler bound by the engine. Returns black if no HDR is loaded.\n"
-                      << "// Sample with a direction vector: texture(envMap, direction).rgb\n"
-                      << "//\n"
-                      << "// Common uses:\n"
-                      << "//   Reflection:  texture(envMap, reflect(-viewDir, normal)).rgb\n"
-                      << "//   Ambient:     texture(envMap, normal).rgb * 0.2\n"
-                      << "//   Sky color:   texture(envMap, vec3(0, 1, 0)).rgb\n"
-                      << "//\n"
-                      << "// Values are HDR (can be > 1.0). Tone map if outputting directly:\n"
-                      << "//   color = color / (color + vec3(1.0));  // Reinhard\n"
-                      << "//\n"
-                      << "layout(set = 1, binding = 0) uniform samplerCube envMap;\n\n"
-                      << "// ── Inputs from vertex shader ──\n"
-                      << "layout(location = 0) in vec3 fragColor;\n\n"
-                      << "layout(location = 0) out vec4 outColor;\n\n"
-                      << "void main() {\n"
-                      << "    // Round point sprite (discard pixels outside circle)\n"
-                      << "    vec2 coord = gl_PointCoord - vec2(0.5);\n"
-                      << "    if (dot(coord, coord) > 0.25) discard;\n\n"
-                      << "    // Example: sample environment map upward for ambient tint\n"
-                      << "    // vec3 ambient = texture(envMap, vec3(0, 1, 0)).rgb * 0.1;\n\n"
-                      << "    outColor = vec4(fragColor, 1.0);\n}\n";
-                    f.close();
-                    kmrb::Log::ok("Created shader: " + name);
-                }
+                createShaderFromTemplate(projectRoot, "particle.frag", "/shaders/render", "custom");
             }
 
             if (ImGui::MenuItem("Import File...")) {
@@ -621,7 +465,7 @@ void UI::drawProjectBrowser() {
 
     if (ImGui::Begin("Project")) {
         if (projectRoot.empty()) {
-            ImGui::TextColored(hex(0x5C5347), "No project root set");
+            ImGui::TextColored(hex(palette::TextDim), "No project root set");
         } else {
             // Refresh the cached tree on a timer instead of scanning every frame
             projectTreeTimer += ImGui::GetIO().DeltaTime;
@@ -648,14 +492,14 @@ void UI::drawProjectBrowser() {
                 ImGuiTreeNodeFlags fileFlags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
                 if (selectedFile == fullPath) fileFlags |= ImGuiTreeNodeFlags_Selected;
 
-                ImGui::PushStyleColor(ImGuiCol_Text, hex(0x5AAFCC));  // Cyan for HDR
+                ImGui::PushStyleColor(ImGuiCol_Text, hex(palette::Cyan));  // Cyan for HDR
                 ImGui::TreeNodeEx(name.c_str(), fileFlags);
                 ImGui::PopStyleColor();
 
                 // Drag-drop source for HDR files
                 if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
                     ImGui::SetDragDropPayload("KMRB_HDR_PATH", fullPath.c_str(), fullPath.size() + 1);
-                    ImGui::TextColored(hex(0x5AAFCC), "%s", name.c_str());
+                    ImGui::TextColored(hex(palette::Cyan), "%s", name.c_str());
                     ImGui::EndDragDropSource();
                 }
 
@@ -663,8 +507,8 @@ void UI::drawProjectBrowser() {
 
                 if (ImGui::IsItemHovered()) {
                     ImGui::BeginTooltip();
-                    ImGui::TextColored(hex(0x8B7D6B), "%s", fullPath.c_str());
-                    ImGui::TextColored(hex(0x5C5347), "Drag onto Scene > Environment to set as skybox");
+                    ImGui::TextColored(hex(palette::TextMuted), "%s", fullPath.c_str());
+                    ImGui::TextColored(hex(palette::TextDim), "Drag onto Scene > Environment to set as skybox");
                     ImGui::EndTooltip();
                 }
             }
@@ -678,7 +522,7 @@ void UI::drawProjectBrowser() {
                 }
                 if (ImGui::IsItemHovered()) {
                     ImGui::BeginTooltip();
-                    ImGui::TextColored(hex(0x5C5347), "No scenes yet — .kmrb files go here");
+                    ImGui::TextColored(hex(palette::TextDim), "No scenes yet — .kmrb files go here");
                     ImGui::EndTooltip();
                 }
             }
@@ -723,9 +567,11 @@ void UI::buildFileTree(const std::string& directory, FileTreeNode& node) {
     std::vector<FileTreeNode> folders, files;
     for (auto& entry : fs::directory_iterator(directory)) {
         if (entry.is_directory()) {
-            // Skip hidden/build/external dirs
+            // Skip hidden/build/external dirs, engine shaders, and templates
+            // (templates are copied via File > New Shader, not edited in place)
             auto name = entry.path().filename().string();
-            if (name[0] == '.' || name == "build" || name == "external" || name == "engine") continue;
+            if (name.empty() || name[0] == '.' || name == "build" || name == "external"
+                || name == "engine" || name == "templates") continue;
             FileTreeNode folder;
             folder.name = name;
             folder.fullPath = entry.path().generic_string();
@@ -780,15 +626,15 @@ void UI::drawFileTreeNodes(const std::vector<FileTreeNode>& nodes) {
 
         // Color code by file type
         if (ext == ".comp") {
-            ImGui::PushStyleColor(ImGuiCol_Text, hex(0xC8A44E));  // Gold for compute
+            ImGui::PushStyleColor(ImGuiCol_Text, hex(palette::Gold));  // Gold for compute
         } else if (ext == ".vert" || ext == ".frag") {
-            ImGui::PushStyleColor(ImGuiCol_Text, hex(0x5A9BD4));  // Blue for render shaders
+            ImGui::PushStyleColor(ImGuiCol_Text, hex(palette::Blue));  // Blue for render shaders
         } else if (ext == ".hdr") {
-            ImGui::PushStyleColor(ImGuiCol_Text, hex(0x5AAFCC));  // Cyan for HDR env maps
+            ImGui::PushStyleColor(ImGuiCol_Text, hex(palette::Cyan));  // Cyan for HDR env maps
         } else if (ext == ".fbx" || ext == ".obj" || ext == ".gltf" || ext == ".glb") {
-            ImGui::PushStyleColor(ImGuiCol_Text, hex(0xB8A47C));  // Warm tan for 3D models
+            ImGui::PushStyleColor(ImGuiCol_Text, hex(palette::Tan));  // Warm tan for 3D models
         } else {
-            ImGui::PushStyleColor(ImGuiCol_Text, hex(0xE8DCC8));  // Primary text
+            ImGui::PushStyleColor(ImGuiCol_Text, hex(palette::Text));  // Primary text
         }
 
         ImGui::TreeNodeEx(name.c_str(), fileFlags);
@@ -797,7 +643,7 @@ void UI::drawFileTreeNodes(const std::vector<FileTreeNode>& nodes) {
         if (ext == ".comp" || ext == ".vert" || ext == ".frag") {
             if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
                 ImGui::SetDragDropPayload("KMRB_SHADER_PATH", fullPath.c_str(), fullPath.size() + 1);
-                ImGui::TextColored(hex(0xC8A44E), "%s", name.c_str());
+                ImGui::TextColored(hex(palette::Gold), "%s", name.c_str());
                 ImGui::EndDragDropSource();
             }
         }
@@ -806,7 +652,7 @@ void UI::drawFileTreeNodes(const std::vector<FileTreeNode>& nodes) {
         if (ext == ".hdr") {
             if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
                 ImGui::SetDragDropPayload("KMRB_HDR_PATH", fullPath.c_str(), fullPath.size() + 1);
-                ImGui::TextColored(hex(0x5AAFCC), "%s", name.c_str());
+                ImGui::TextColored(hex(palette::Cyan), "%s", name.c_str());
                 ImGui::EndDragDropSource();
             }
         }
@@ -815,7 +661,7 @@ void UI::drawFileTreeNodes(const std::vector<FileTreeNode>& nodes) {
         if (ext == ".fbx" || ext == ".obj" || ext == ".gltf" || ext == ".glb") {
             if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
                 ImGui::SetDragDropPayload("KMRB_MESH_PATH", fullPath.c_str(), fullPath.size() + 1);
-                ImGui::TextColored(hex(0xB8A47C), "%s", name.c_str());
+                ImGui::TextColored(hex(palette::Tan), "%s", name.c_str());
                 ImGui::EndDragDropSource();
             }
         }
@@ -827,8 +673,7 @@ void UI::drawFileTreeNodes(const std::vector<FileTreeNode>& nodes) {
 
         // Double click = open in system editor (VS Code, Notepad++, etc.)
         if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
-            std::string cmd = "start \"\" \"" + fullPath + "\"";
-            _popen(cmd.c_str(), "r");
+            openInSystemEditor(fullPath);
             kmrb::Log::info("Opening in editor: " + name);
         }
 
@@ -836,19 +681,14 @@ void UI::drawFileTreeNodes(const std::vector<FileTreeNode>& nodes) {
         std::string popupId = "ctx_" + fullPath;
         if (ImGui::BeginPopupContextItem(popupId.c_str())) {
             if (ImGui::MenuItem("Open in Editor")) {
-                std::string cmd = "start \"\" \"" + fullPath + "\"";
-                _popen(cmd.c_str(), "r");
+                openInSystemEditor(fullPath);
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Show in Explorer")) {
-                // Windows explorer needs backslashes
-                std::string winPath = fullPath;
-                std::replace(winPath.begin(), winPath.end(), '/', '\\');
-                std::string cmd = "explorer /select,\"" + winPath + "\"";
-                system(cmd.c_str());
+                showInExplorer(fullPath);
             }
             ImGui::Separator();
-            ImGui::PushStyleColor(ImGuiCol_Text, hex(0xD46B5A)); // error-text red
+            ImGui::PushStyleColor(ImGuiCol_Text, hex(palette::Red)); // error-text red
             if (ImGui::MenuItem("Delete")) {
                 std::filesystem::remove(fullPath);
                 if (selectedFile == fullPath) selectedFile.clear();
@@ -862,12 +702,12 @@ void UI::drawFileTreeNodes(const std::vector<FileTreeNode>& nodes) {
         // Tooltip
         if (ImGui::IsItemHovered() && !ImGui::IsPopupOpen(popupId.c_str())) {
             ImGui::BeginTooltip();
-            ImGui::TextColored(hex(0x8B7D6B), "%s", fullPath.c_str());
+            ImGui::TextColored(hex(palette::TextMuted), "%s", fullPath.c_str());
             if (ext == ".comp" || ext == ".vert" || ext == ".frag") {
-                ImGui::TextColored(hex(0x5C5347), "Drag onto Inspector to attach");
-                ImGui::TextColored(hex(0x5C5347), "Double-click: open in editor");
+                ImGui::TextColored(hex(palette::TextDim), "Drag onto Inspector to attach");
+                ImGui::TextColored(hex(palette::TextDim), "Double-click: open in editor");
             } else if (ext == ".hdr") {
-                ImGui::TextColored(hex(0x5C5347), "Drag onto Scene > Environment to set as skybox");
+                ImGui::TextColored(hex(palette::TextDim), "Drag onto Scene > Environment to set as skybox");
             }
             ImGui::EndTooltip();
         }
@@ -885,7 +725,7 @@ void UI::drawSceneHierarchy() {
 
     if (ImGui::Begin("Scene Hierarchy")) {
         if (!registry) {
-            ImGui::TextColored(hex(0x5C5347), "No scene loaded");
+            ImGui::TextColored(hex(palette::TextDim), "No scene loaded");
             ImGui::End();
             return;
         }
@@ -895,7 +735,7 @@ void UI::drawSceneHierarchy() {
             ImGui::OpenPopup("add_entity_popup");
         }
         ImGui::SameLine();
-        ImGui::TextColored(hex(0x5C5347), "Add Entity");
+        ImGui::TextColored(hex(palette::TextDim), "Add Entity");
 
         drawAddEntityMenu();
         ImGui::Separator();
@@ -950,7 +790,7 @@ void UI::drawSceneHierarchy() {
                 }
 
                 ImGui::Separator();
-                ImGui::PushStyleColor(ImGuiCol_Text, hex(0xD46B5A));
+                ImGui::PushStyleColor(ImGuiCol_Text, hex(palette::Red));
                 if (ImGui::MenuItem("Delete")) {
                     entityToDelete = entity;
                 }
@@ -1048,7 +888,7 @@ void UI::drawAddEntityMenu() {
 
             registry->emplace<Name>(entity, name);
             registry->emplace<Transform>(entity, Transform{
-                {0.0f, 2.0f, 5.0f}, {-15.0f, -90.0f, 0.0f}, {1.0f, 1.0f, 1.0f}});
+                CAMERA_SPAWN_POSITION, CAMERA_SPAWN_ROTATION, {1.0f, 1.0f, 1.0f}});
             registry->emplace<CameraComponent>(entity);
             if (count == 0) registry->get<CameraComponent>(entity).active = true;
 
@@ -1072,19 +912,33 @@ void UI::drawAddEntityMenu() {
             Log::ok("Created: " + name);
         }
 
-        if (ImGui::MenuItem("Mesh")) {
-            auto entity = registry->create();
-            int count = 0;
-            registry->view<MeshRendererComponent>().each([&](auto) { count++; });
-            std::string name = count == 0 ? "Mesh" : "Mesh " + std::to_string(count + 1);
+        if (ImGui::BeginMenu("Mesh")) {
+            // Create a mesh entity. `meshPath` is empty for "Empty", or a "__primitive_*"
+            // sentinel for a primitive (the renderer resolves it to the cached GPU mesh).
+            // meshCacheKey stays empty so syncMeshInstances resolves it next frame.
+            auto createMesh = [&](const char* base, const char* meshPath) {
+                auto entity = registry->create();
+                // Number per primitive type (same meshPath), not by total mesh count, so the
+                // first Sphere is "Sphere" even if a Cube already exists.
+                int count = 0;
+                registry->view<MeshRendererComponent>().each([&](auto, auto& m) {
+                    if (m.meshPath == meshPath) count++;
+                });
+                std::string name = count == 0 ? base : std::string(base) + " " + std::to_string(count + 1);
 
-            registry->emplace<Name>(entity, name);
-            registry->emplace<Transform>(entity);
-            registry->emplace<MeshRendererComponent>(entity);
+                registry->emplace<Name>(entity, name);
+                registry->emplace<Transform>(entity);
+                registry->emplace<MeshRendererComponent>(entity).meshPath = meshPath;
 
-            selectedEntity = entity;
-            selectionType = SelectionType::Mesh;
-            Log::ok("Created: " + name);
+                selectedEntity = entity;
+                selectionType = SelectionType::Mesh;
+                Log::ok("Created: " + name);
+            };
+
+            if (ImGui::MenuItem("Empty"))  createMesh("Mesh",   "");
+            if (ImGui::MenuItem("Cube"))   createMesh("Cube",   PRIMITIVE_CUBE);
+            if (ImGui::MenuItem("Sphere")) createMesh("Sphere", PRIMITIVE_SPHERE);
+            ImGui::EndMenu();
         }
 
         if (ImGui::MenuItem("Light")) {
@@ -1105,7 +959,7 @@ void UI::drawAddEntityMenu() {
 
     // "+" button popup
     if (ImGui::BeginPopup("add_entity_popup")) {
-        ImGui::TextColored(hex(0x8B7D6B), "Add Entity");
+        ImGui::TextColored(hex(palette::TextMuted), "Add Entity");
         ImGui::Separator();
         drawMenuItems();
         ImGui::EndPopup();
@@ -1113,7 +967,7 @@ void UI::drawAddEntityMenu() {
 
     // Right-click empty space popup
     if (ImGui::BeginPopupContextWindow("hierarchy_context", ImGuiPopupFlags_NoOpenOverItems)) {
-        ImGui::TextColored(hex(0x8B7D6B), "Add Entity");
+        ImGui::TextColored(hex(palette::TextMuted), "Add Entity");
         ImGui::Separator();
         drawMenuItems();
         ImGui::EndPopup();
@@ -1162,40 +1016,40 @@ void UI::drawViewport(vk::DescriptorSet viewportTexture, vk::Extent2D viewportEx
 
         ImDrawList* drawList = ImGui::GetWindowDrawList();
         drawList->AddRectFilled(barPos, ImVec2(barPos.x + windowSize.x, barPos.y + barHeight),
-            IM_COL32(14, 13, 11, 200)); // base bg
+            ImGui::ColorConvertFloat4ToU32(hex(palette::Base, 200.0f / 255.0f)));
 
         ImGui::SetCursorScreenPos(ImVec2(barPos.x + 12, barPos.y + 4));
 
         // FPS
-        ImGui::TextColored(hex(0x8B7D6B), "FPS");
+        ImGui::TextColored(hex(palette::TextMuted), "FPS");
         ImGui::SameLine();
-        ImGui::TextColored(hex(0xE8DCC8), "%.0f", fps);
+        ImGui::TextColored(hex(palette::Text), "%.0f", fps);
         ImGui::SameLine(0, 20);
 
         // Particle count
-        ImGui::TextColored(hex(0x8B7D6B), "Particles");
+        ImGui::TextColored(hex(palette::TextMuted), "Particles");
         ImGui::SameLine();
-        ImGui::TextColored(hex(0xE8DCC8), "%u", particleCount);
+        ImGui::TextColored(hex(palette::Text), "%u", particleCount);
         ImGui::SameLine(0, 20);
 
         // Mesh count + aggregate vertex total
-        ImGui::TextColored(hex(0x8B7D6B), "Meshes");
+        ImGui::TextColored(hex(palette::TextMuted), "Meshes");
         ImGui::SameLine();
-        ImGui::TextColored(hex(0xE8DCC8), "%u", meshCount);
+        ImGui::TextColored(hex(palette::Text), "%u", meshCount);
         if (meshTotalVerts > 0) {
             ImGui::SameLine(0, 4);
-            ImGui::TextColored(hex(0x5C5347), "(%sv)", fmtVerts(meshTotalVerts).c_str());
+            ImGui::TextColored(hex(palette::TextDim), "(%sv)", fmtVerts(meshTotalVerts).c_str());
         }
         ImGui::SameLine(0, 20);
 
         // Resolution: viewport panel size | render framebuffer size
-        ImGui::TextColored(hex(0x8B7D6B), "Viewport");
+        ImGui::TextColored(hex(palette::TextMuted), "Viewport");
         ImGui::SameLine();
-        ImGui::TextColored(hex(0xE8DCC8), "%.0fx%.0f", avail.x, avail.y);
+        ImGui::TextColored(hex(palette::Text), "%.0fx%.0f", avail.x, avail.y);
         ImGui::SameLine(0, 10);
-        ImGui::TextColored(hex(0x8B7D6B), "Render");
+        ImGui::TextColored(hex(palette::TextMuted), "Render");
         ImGui::SameLine();
-        ImGui::TextColored(hex(0xE8DCC8), "%dx%d", renderWidth, renderHeight);
+        ImGui::TextColored(hex(palette::Text), "%dx%d", renderWidth, renderHeight);
     } else {
         viewportHovered = false;
     }
@@ -1210,16 +1064,16 @@ void UI::drawInspector(uint32_t particleCount,
     if (ImGui::Begin("Inspector")) {
         // ── Scene-level settings (no entity selected, Scene root clicked) ──
         if (selectionType == SelectionType::Scene) {
-            ImGui::TextColored(hex(0xC8A44E), "Scene Settings");
+            ImGui::TextColored(hex(palette::Gold), "Scene Settings");
             ImGui::Separator();
 
             if (ImGui::CollapsingHeader("Environment", ImGuiTreeNodeFlags_DefaultOpen)) {
                 namespace fs = std::filesystem;
                 std::string filename = envMapPath.empty() ? "(none)" : fs::path(envMapPath).filename().string();
 
-                ImGui::TextColored(hex(0x8B7D6B), "HDR Map");
+                ImGui::TextColored(hex(palette::TextMuted), "HDR Map");
                 ImGui::SameLine(110);
-                ImGui::TextColored(envMapPath.empty() ? hex(0x5C5347) : hex(0xE8DCC8), "%s", filename.c_str());
+                ImGui::TextColored(envMapPath.empty() ? hex(palette::TextDim) : hex(palette::Text), "%s", filename.c_str());
 
                 // Clear button
                 if (!envMapPath.empty()) {
@@ -1241,7 +1095,7 @@ void UI::drawInspector(uint32_t particleCount,
                 }
 
                 if (envMapPath.empty()) {
-                    ImGui::TextColored(hex(0x5C5347), "Drag an .hdr file here from the Project Browser");
+                    ImGui::TextColored(hex(palette::TextDim), "Drag an .hdr file here from the Project Browser");
                 }
             }
 
@@ -1250,7 +1104,7 @@ void UI::drawInspector(uint32_t particleCount,
         }
 
         if (!registry || selectedEntity == entt::null || !registry->valid(selectedEntity)) {
-            ImGui::TextColored(hex(0x5C5347), "No entity selected");
+            ImGui::TextColored(hex(palette::TextDim), "No entity selected");
             ImGui::End();
             return;
         }
@@ -1300,28 +1154,48 @@ void UI::drawInspector(uint32_t particleCount,
         auto* pl = registry->try_get<PipelineComponent>(selectedEntity);
         if (pl) {
             if (ImGui::CollapsingHeader("Pipeline", ImGuiTreeNodeFlags_DefaultOpen)) {
-                ImGui::TextColored(hex(0x8B7D6B), "Particles");
+                ImGui::TextColored(hex(palette::TextMuted), "Particles");
                 ImGui::SameLine(110);
-                ImGui::TextColored(hex(0xE8DCC8), "%u", pl->particleCount);
+                // Single source of truth for the particle count — the renderer
+                // watches this component and reallocates the SSBOs on change.
+                // Commit only when editing finishes (Enter / lose focus), not per
+                // keystroke, since every change triggers a GPU buffer reallocation.
+                // InputInt wraps InputScalar, which rejects EnterReturnsTrue — ImGui
+                // directs us to IsItemDeactivatedAfterEdit() for this exact case.
+                int count = static_cast<int>(pl->particleCount);
+                ImGui::SetNextItemWidth(-1);
+                ImGui::InputInt("##particle_count", &count, 1000, 10000);
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    pl->particleCount = static_cast<uint32_t>(std::clamp(count, 100, 1000000));
+                }
 
-                ImGui::TextColored(hex(0x8B7D6B), "Status");
+                ImGui::TextColored(hex(palette::TextMuted), "Status");
                 ImGui::SameLine(110);
-                ImGui::TextColored(hex(0x7BA56E), "Running");
+                bool compiled = false;
+                if (shaderInstancesPtr) {
+                    auto* insts = static_cast<std::unordered_map<uint32_t, Renderer::ShaderInstance>*>(shaderInstancesPtr);
+                    auto stIt = insts->find(static_cast<uint32_t>(selectedEntity));
+                    compiled = stIt != insts->end() &&
+                               (stIt->second.computePipeline || stIt->second.graphicsPipeline);
+                }
+                if (!compiled)       ImGui::TextColored(hex(palette::TextDim), "Not compiled");
+                else if (simRunning) ImGui::TextColored(hex(palette::Green), "Running");
+                else                 ImGui::TextColored(hex(palette::Gold), "Paused");
 
                 ImGui::Spacing();
 
                 // Shader program slots
                 auto* shaderProg = registry->try_get<ShaderProgramComponent>(selectedEntity);
                 if (shaderProg) {
-                    ImGui::TextColored(hex(0xC8A44E), "Shader Program");
+                    ImGui::TextColored(hex(palette::Gold), "Shader Program");
 
                     // Helper lambda for a shader slot with drag-drop target
                     auto drawShaderSlot = [&](const char* label, std::string& path, const char* ext) {
                         namespace fs = std::filesystem;
                         std::string filename = path.empty() ? "(none)" : fs::path(path).filename().string();
-                        ImGui::TextColored(hex(0x8B7D6B), "  %s", label);
+                        ImGui::TextColored(hex(palette::TextMuted), "  %s", label);
                         ImGui::SameLine(110);
-                        ImGui::TextColored(path.empty() ? hex(0x5C5347) : hex(0xE8DCC8), "%s", filename.c_str());
+                        ImGui::TextColored(path.empty() ? hex(palette::TextDim) : hex(palette::Text), "%s", filename.c_str());
 
                         // Clear button
                         if (!path.empty()) {
@@ -1374,7 +1248,7 @@ void UI::drawInspector(uint32_t particleCount,
                         auto& inst = instIt->second;
                         if (!inst.reflectedParams.empty()) {
                             ImGui::Spacing();
-                            ImGui::TextColored(hex(0xC8A44E), "Parameters");
+                            ImGui::TextColored(hex(palette::Gold), "Parameters");
 
                             for (size_t pi = 0; pi < inst.reflectedParams.size(); pi++) {
                                 auto& param = inst.reflectedParams[pi];
@@ -1405,10 +1279,10 @@ void UI::drawInspector(uint32_t particleCount,
                                         break;
                                     case Renderer::ReflectedParam::Mat4:
                                         // Matrices are not easily editable — just show the name
-                                        ImGui::TextColored(hex(0x5C5347), "%s (mat4)", param.name.c_str());
+                                        ImGui::TextColored(hex(palette::TextDim), "%s (mat4)", param.name.c_str());
                                         break;
                                     default:
-                                        ImGui::TextColored(hex(0x5C5347), "%s (unsupported type)", param.name.c_str());
+                                        ImGui::TextColored(hex(palette::TextDim), "%s (unsupported type)", param.name.c_str());
                                         break;
                                 }
 
@@ -1432,17 +1306,17 @@ void UI::drawInspector(uint32_t particleCount,
                 auto itA = buffers.find("particle_a");
                 if (itA != buffers.end()) {
                     auto& pa = itA->second;
-                    ImGui::TextColored(hex(0x8B7D6B), "SSBO size");
+                    ImGui::TextColored(hex(palette::TextMuted), "SSBO size");
                     ImGui::SameLine(110);
-                    ImGui::TextColored(hex(0xE8DCC8), "%s (x2)", formatSize(pa.size).c_str());
+                    ImGui::TextColored(hex(palette::Text), "%s (x2)", formatSize(pa.size).c_str());
 
-                    ImGui::TextColored(hex(0x8B7D6B), "Stride");
+                    ImGui::TextColored(hex(palette::TextMuted), "Stride");
                     ImGui::SameLine(110);
-                    ImGui::TextColored(hex(0xE8DCC8), "%u bytes", pa.elementStride);
+                    ImGui::TextColored(hex(palette::Text), "%u bytes", pa.elementStride);
 
-                    ImGui::TextColored(hex(0x8B7D6B), "Precision");
+                    ImGui::TextColored(hex(palette::TextMuted), "Precision");
                     ImGui::SameLine(110);
-                    ImGui::TextColored(hex(0xE8DCC8), "float32");
+                    ImGui::TextColored(hex(palette::Text), "float32");
                 }
 
                 ImGui::Spacing();
@@ -1460,7 +1334,7 @@ void UI::drawInspector(uint32_t particleCount,
                 ImGui::DragFloat("Size", &grid->size, 0.5f, 1.0f, 100.0f);
                 ImGui::DragInt("Cells", &grid->cellCount, 1, 1, 100);
                 ImGui::ColorEdit4("Color", &grid->color.x);
-                ImGui::TextColored(hex(0x5C5347), "Cell size: %.2f", grid->size / grid->cellCount);
+                ImGui::TextColored(hex(palette::TextDim), "Cell size: %.2f", grid->size / grid->cellCount);
             }
         }
 
@@ -1492,11 +1366,10 @@ void UI::drawInspector(uint32_t particleCount,
 
                 // Mesh file slot — drag-drop target for KMRB_MESH_PATH
                 {
-                    std::string meshLabel = meshComp->meshPath.empty()
-                        ? "(cube primitive)" : fs::path(meshComp->meshPath).filename().string();
-                    ImGui::TextColored(hex(0x8B7D6B), "  Mesh");
+                    std::string meshLabel = meshDisplayLabel(meshComp->meshPath);
+                    ImGui::TextColored(hex(palette::TextMuted), "  Mesh");
                     ImGui::SameLine(110);
-                    ImGui::TextColored(meshComp->meshPath.empty() ? hex(0x5C5347) : hex(0xE8DCC8),
+                    ImGui::TextColored(meshComp->meshPath.empty() ? hex(palette::TextDim) : hex(palette::Text),
                                        "%s", meshLabel.c_str());
 
                     if (!meshComp->meshPath.empty()) {
@@ -1523,7 +1396,7 @@ void UI::drawInspector(uint32_t particleCount,
                 // ── Geometry stats ──
                 if (ImGui::CollapsingHeader("Geometry", ImGuiTreeNodeFlags_DefaultOpen)) {
                     if (meshComp->vertexCount == 0) {
-                        ImGui::TextColored(hex(0x5C5347), "  Loading...");
+                        ImGui::TextColored(hex(palette::TextDim), "  Loading...");
                     } else {
                         auto fmtBytes = [](uint32_t b) -> std::string {
                             if (b >= 1024 * 1024)
@@ -1535,30 +1408,30 @@ void UI::drawInspector(uint32_t particleCount,
                             return std::to_string(b) + " B";
                         };
 
-                        ImGui::TextColored(hex(0x8B7D6B), "  Vertices");
+                        ImGui::TextColored(hex(palette::TextMuted), "  Vertices");
                         ImGui::SameLine(110);
-                        ImGui::TextColored(hex(0xE8DCC8), "%u", meshComp->vertexCount);
+                        ImGui::TextColored(hex(palette::Text), "%u", meshComp->vertexCount);
 
-                        ImGui::TextColored(hex(0x8B7D6B), "  Triangles");
+                        ImGui::TextColored(hex(palette::TextMuted), "  Triangles");
                         ImGui::SameLine(110);
-                        ImGui::TextColored(hex(0xE8DCC8), "%u", meshComp->indexCount / 3);
+                        ImGui::TextColored(hex(palette::Text), "%u", meshComp->indexCount / 3);
 
-                        ImGui::TextColored(hex(0x8B7D6B), "  GPU Mem");
+                        ImGui::TextColored(hex(palette::TextMuted), "  GPU Mem");
                         ImGui::SameLine(110);
-                        ImGui::TextColored(hex(0xE8DCC8), "%s",
+                        ImGui::TextColored(hex(palette::Text), "%s",
                             meshComp->gpuBytes > 0 ? fmtBytes(meshComp->gpuBytes).c_str() : "—");
 
-                        ImGui::TextColored(hex(0x8B7D6B), "  Status");
+                        ImGui::TextColored(hex(palette::TextMuted), "  Status");
                         ImGui::SameLine(110);
                         if (meshInstancesPtr) {
                             auto* insts = static_cast<std::unordered_map<uint32_t,
                                               Renderer::MeshShaderInstance>*>(meshInstancesPtr);
                             uint32_t ek = static_cast<uint32_t>(selectedEntity);
                             bool ready = insts->count(ek) && (*insts).at(ek).graphicsPipeline;
-                            if (ready) ImGui::TextColored(hex(0x7BA56E), "Ready");
-                            else       ImGui::TextColored(hex(0xC8A44E), "Building");
+                            if (ready) ImGui::TextColored(hex(palette::Green), "Ready");
+                            else       ImGui::TextColored(hex(palette::Gold), "Building");
                         } else {
-                            ImGui::TextColored(hex(0x5C5347), "—");
+                            ImGui::TextColored(hex(palette::TextDim), "—");
                         }
                     }
                 }
@@ -1566,9 +1439,9 @@ void UI::drawInspector(uint32_t particleCount,
                 // Shader slots (Vertex + Fragment) — same drag-drop pattern as Pipeline
                 auto drawMeshShaderSlot = [&](const char* label, std::string& path, const char* ext) {
                     std::string filename = path.empty() ? "(default)" : fs::path(path).filename().string();
-                    ImGui::TextColored(hex(0x8B7D6B), "  %s", label);
+                    ImGui::TextColored(hex(palette::TextMuted), "  %s", label);
                     ImGui::SameLine(110);
-                    ImGui::TextColored(path.empty() ? hex(0x5C5347) : hex(0xE8DCC8), "%s", filename.c_str());
+                    ImGui::TextColored(path.empty() ? hex(palette::TextDim) : hex(palette::Text), "%s", filename.c_str());
 
                     if (!path.empty()) {
                         ImGui::SameLine();
@@ -1596,12 +1469,12 @@ void UI::drawInspector(uint32_t particleCount,
                 };
 
                 ImGui::Spacing();
-                ImGui::TextColored(hex(0xC8A44E), "Shaders");
+                ImGui::TextColored(hex(palette::Gold), "Shaders");
                 drawMeshShaderSlot("Vertex", meshComp->vertexShaderPath, ".vert");
                 drawMeshShaderSlot("Fragment", meshComp->fragmentShaderPath, ".frag");
 
                 ImGui::Spacing();
-                ImGui::TextColored(hex(0xC8A44E), "Material");
+                ImGui::TextColored(hex(palette::Gold), "Material");
                 ImGui::ColorEdit4("Color", &meshComp->color.x);
                 bool wireChanged = ImGui::Checkbox("Wireframe", &meshComp->wireframe);
                 if (wireChanged) meshComp->shaderDirty = true;
@@ -1613,7 +1486,7 @@ void UI::drawInspector(uint32_t particleCount,
                     auto instIt = instances->find(key);
                     if (instIt != instances->end() && !instIt->second.reflectedParams.empty()) {
                         ImGui::Spacing();
-                        ImGui::TextColored(hex(0xC8A44E), "Parameters");
+                        ImGui::TextColored(hex(palette::Gold), "Parameters");
                         auto& inst = instIt->second;
                         for (auto& param : inst.reflectedParams) {
                             ImGui::PushID(param.offset);
@@ -1650,7 +1523,7 @@ void UI::drawConsole() {
         // Clear button
         if (ImGui::SmallButton("Clear")) Log::clear();
         ImGui::SameLine();
-        ImGui::TextColored(hex(0x5C5347), "(%zu entries)", Log::getEntries().size());
+        ImGui::TextColored(hex(palette::TextDim), "(%zu entries)", Log::getEntries().size());
         ImGui::Separator();
 
         // Scrollable log
@@ -1660,27 +1533,27 @@ void UI::drawConsole() {
             // Timestamp
             int mins = static_cast<int>(entry.timestamp) / 60;
             float secs = entry.timestamp - mins * 60;
-            ImGui::TextColored(hex(0x5C5347), "%02d:%05.2f", mins, secs);
+            ImGui::TextColored(hex(palette::TextDim), "%02d:%05.2f", mins, secs);
             ImGui::SameLine();
 
             // Level tag with color
             switch (entry.level) {
                 case LogLevel::Info:
-                    ImGui::TextColored(hex(0x5A9BD4), "[INF]"); break;
+                    ImGui::TextColored(hex(palette::Blue), "[INF]"); break;
                 case LogLevel::Ok:
-                    ImGui::TextColored(hex(0x7BA56E), "[OK]");  break;
+                    ImGui::TextColored(hex(palette::Green), "[OK]");  break;
                 case LogLevel::Warn:
-                    ImGui::TextColored(hex(0xC8A44E), "[WRN]"); break;
+                    ImGui::TextColored(hex(palette::Gold), "[WRN]"); break;
                 case LogLevel::Error:
-                    ImGui::TextColored(hex(0xD46B5A), "[ERR]"); break;
+                    ImGui::TextColored(hex(palette::Red), "[ERR]"); break;
             }
             ImGui::SameLine();
 
             // Message — errors in red, rest in primary text
             if (entry.level == LogLevel::Error)
-                ImGui::TextColored(hex(0xD46B5A), "%s", entry.message.c_str());
+                ImGui::TextColored(hex(palette::Red), "%s", entry.message.c_str());
             else
-                ImGui::TextColored(hex(0xE8DCC8), "%s", entry.message.c_str());
+                ImGui::TextColored(hex(palette::Text), "%s", entry.message.c_str());
         }
 
         // Auto-scroll to bottom when new entries arrive
@@ -1720,9 +1593,11 @@ void UI::drawDataOutput() {
                     dataRefreshTimer += ImGui::GetIO().DeltaTime;
                     if (dataRefreshTimer >= dataRefreshInterval) {
                         dataRefreshTimer = 0.0f;
-                        if (bufferManager->exists("particle_b")) {
-                            cachedParticleData = bufferManager->readBack("particle_b");
-                            cachedElementCount = bufferManager->getInfo("particle_b").elementCount;
+                        // latestParticleBuffer is ping-pong-aware (set by the
+                        // renderer) — a fixed name would read one step stale
+                        if (bufferManager->exists(latestParticleBuffer)) {
+                            cachedParticleData = bufferManager->readBack(latestParticleBuffer);
+                            cachedElementCount = bufferManager->getInfo(latestParticleBuffer).elementCount;
                         }
                     }
                 }
@@ -1730,16 +1605,16 @@ void UI::drawDataOutput() {
                 ImGui::Separator();
 
                 if (cachedParticleData.empty()) {
-                    ImGui::TextColored(hex(0x5C5347), "No data — waiting for first refresh...");
+                    ImGui::TextColored(hex(palette::TextDim), "No data — waiting for first refresh...");
                 } else {
-                    ImGui::TextColored(hex(0x5C5347), "%u particles", cachedElementCount);
+                    ImGui::TextColored(hex(palette::TextDim), "%u particles", cachedElementCount);
 
-                    // Scrollable particle data table
-                    // Particle SSBO layout: 12 floats per particle
+                    // Scrollable particle data table. Float layout follows the
+                    // Particle struct in kmrb_types.hpp (3 vec4s):
                     //   [0] pos.x  [1] pos.y  [2] pos.z  [3] pointSize
                     //   [4] vel.x  [5] vel.y  [6] vel.z  [7] lifetime
                     //   [8] r      [9] g      [10] b     [11] a
-                    constexpr int FLOATS_PER_PARTICLE = 12;
+                    constexpr int FLOATS_PER_PARTICLE = sizeof(Particle) / sizeof(float);
 
                     ImGuiTableFlags tableFlags = ImGuiTableFlags_ScrollY
                                                | ImGuiTableFlags_RowBg
@@ -1748,16 +1623,18 @@ void UI::drawDataOutput() {
                                                | ImGuiTableFlags_Resizable
                                                | ImGuiTableFlags_Reorderable;
 
-                    if (ImGui::BeginTable("particle_table", 8, tableFlags)) {
+                    if (ImGui::BeginTable("particle_table", 10, tableFlags)) {
                         ImGui::TableSetupScrollFreeze(0, 1); // Freeze header row
-                        ImGui::TableSetupColumn("ID",    ImGuiTableColumnFlags_WidthFixed, 50.0f);
-                        ImGui::TableSetupColumn("pos.x", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-                        ImGui::TableSetupColumn("pos.y", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-                        ImGui::TableSetupColumn("pos.z", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-                        ImGui::TableSetupColumn("vel.x", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-                        ImGui::TableSetupColumn("vel.y", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-                        ImGui::TableSetupColumn("vel.z", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-                        ImGui::TableSetupColumn("mass",  ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                        ImGui::TableSetupColumn("ID",       ImGuiTableColumnFlags_WidthFixed, 50.0f);
+                        ImGui::TableSetupColumn("pos.x",    ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                        ImGui::TableSetupColumn("pos.y",    ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                        ImGui::TableSetupColumn("pos.z",    ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                        ImGui::TableSetupColumn("vel.x",    ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                        ImGui::TableSetupColumn("vel.y",    ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                        ImGui::TableSetupColumn("vel.z",    ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                        ImGui::TableSetupColumn("size",     ImGuiTableColumnFlags_WidthFixed, 55.0f);
+                        ImGui::TableSetupColumn("lifetime", ImGuiTableColumnFlags_WidthFixed, 65.0f);
+                        ImGui::TableSetupColumn("color",    ImGuiTableColumnFlags_WidthFixed, 50.0f);
                         ImGui::TableHeadersRow();
 
                         // Use clipper for 10k+ rows — only renders visible rows
@@ -1784,7 +1661,16 @@ void UI::drawDataOutput() {
                                 ImGui::TableSetColumnIndex(6);
                                 ImGui::Text("%.3f", cachedParticleData[offset + 6]);
                                 ImGui::TableSetColumnIndex(7);
-                                ImGui::Text("%.2f", cachedParticleData[offset + 3]); // pointSize as mass
+                                ImGui::Text("%.2f", cachedParticleData[offset + 3]); // position.w = point size
+                                ImGui::TableSetColumnIndex(8);
+                                ImGui::Text("%.2f", cachedParticleData[offset + 7]); // velocity.w = lifetime
+                                ImGui::TableSetColumnIndex(9);
+                                // Color swatch — hover shows the exact RGBA values
+                                ImVec4 pcol(cachedParticleData[offset + 8],  cachedParticleData[offset + 9],
+                                            cachedParticleData[offset + 10], cachedParticleData[offset + 11]);
+                                ImGui::PushID(row);
+                                ImGui::ColorButton("##pcol", pcol, ImGuiColorEditFlags_AlphaPreview, ImVec2(36, 14));
+                                ImGui::PopID();
                             }
                         }
                         ImGui::EndTable();
@@ -1806,7 +1692,7 @@ void UI::drawDataOutput() {
                 };
 
                 if (!registry) {
-                    ImGui::TextColored(hex(0x5C5347), "No scene loaded");
+                    ImGui::TextColored(hex(palette::TextDim), "No scene loaded");
                 } else {
                     auto meshView = registry->view<MeshRendererComponent, Name>();
 
@@ -1822,26 +1708,26 @@ void UI::drawDataOutput() {
                     }
 
                     // Summary line
-                    ImGui::TextColored(hex(0x8B7D6B), "Total");
+                    ImGui::TextColored(hex(palette::TextMuted), "Total");
                     ImGui::SameLine(60);
-                    ImGui::TextColored(hex(0xE8DCC8), "%d mesh%s", meshCount, meshCount == 1 ? "" : "es");
+                    ImGui::TextColored(hex(palette::Text), "%d mesh%s", meshCount, meshCount == 1 ? "" : "es");
                     ImGui::SameLine(0, 20);
-                    ImGui::TextColored(hex(0x8B7D6B), "Verts");
+                    ImGui::TextColored(hex(palette::TextMuted), "Verts");
                     ImGui::SameLine();
-                    ImGui::TextColored(hex(0xE8DCC8), "%u", totalVerts);
+                    ImGui::TextColored(hex(palette::Text), "%u", totalVerts);
                     ImGui::SameLine(0, 20);
-                    ImGui::TextColored(hex(0x8B7D6B), "Tris");
+                    ImGui::TextColored(hex(palette::TextMuted), "Tris");
                     ImGui::SameLine();
-                    ImGui::TextColored(hex(0xE8DCC8), "%u", totalTris);
+                    ImGui::TextColored(hex(palette::Text), "%u", totalTris);
                     ImGui::SameLine(0, 20);
-                    ImGui::TextColored(hex(0x8B7D6B), "GPU");
+                    ImGui::TextColored(hex(palette::TextMuted), "GPU");
                     ImGui::SameLine();
-                    ImGui::TextColored(hex(0xE8DCC8), "%s", formatMeshSize(totalBytes).c_str());
+                    ImGui::TextColored(hex(palette::Text), "%s", formatMeshSize(totalBytes).c_str());
 
                     ImGui::Separator();
 
                     if (meshCount == 0) {
-                        ImGui::TextColored(hex(0x5C5347), "No mesh entities — add a Mesh in the Scene Hierarchy");
+                        ImGui::TextColored(hex(palette::TextDim), "No mesh entities — add a Mesh in the Scene Hierarchy");
                     } else {
                         ImGuiTableFlags tableFlags = ImGuiTableFlags_ScrollY
                                                    | ImGuiTableFlags_RowBg
@@ -1870,34 +1756,34 @@ void UI::drawDataOutput() {
                                 ImGui::TableNextRow();
 
                                 ImGui::TableSetColumnIndex(0);
-                                ImGui::TextColored(hex(0xE8DCC8), "%s", nm ? nm->value.c_str() : "Mesh");
+                                ImGui::TextColored(hex(palette::Text), "%s", nm ? nm->value.c_str() : "Mesh");
 
                                 ImGui::TableSetColumnIndex(1);
                                 if (m.meshPath.empty()) {
-                                    ImGui::TextColored(hex(0x5C5347), "(cube primitive)");
+                                    ImGui::TextColored(hex(palette::TextDim), "(no mesh)");
                                 } else {
-                                    std::string fname = std::filesystem::path(m.meshPath).filename().string();
-                                    ImGui::TextColored(hex(0xB8A47C), "%s", fname.c_str());
+                                    ImGui::TextColored(hex(palette::Tan), "%s",
+                                                       meshDisplayLabel(m.meshPath).c_str());
                                 }
 
                                 ImGui::TableSetColumnIndex(2);
                                 if (m.vertexCount > 0) ImGui::Text("%u", m.vertexCount);
-                                else ImGui::TextColored(hex(0x5C5347), "—");
+                                else ImGui::TextColored(hex(palette::TextDim), "—");
 
                                 ImGui::TableSetColumnIndex(3);
                                 if (m.indexCount > 0) ImGui::Text("%u", m.indexCount / 3);
-                                else ImGui::TextColored(hex(0x5C5347), "—");
+                                else ImGui::TextColored(hex(palette::TextDim), "—");
 
                                 ImGui::TableSetColumnIndex(4);
                                 if (m.gpuBytes > 0) ImGui::Text("%s", formatMeshSize(m.gpuBytes).c_str());
-                                else ImGui::TextColored(hex(0x5C5347), "—");
+                                else ImGui::TextColored(hex(palette::TextDim), "—");
 
                                 ImGui::TableSetColumnIndex(5);
                                 uint32_t ek = static_cast<uint32_t>(entity);
                                 bool ready = meshInsts && meshInsts->count(ek) &&
                                              (*meshInsts).at(ek).graphicsPipeline;
-                                if (ready) ImGui::TextColored(hex(0x7BA56E), "Ready");
-                                else       ImGui::TextColored(hex(0xC8A44E), "Building");
+                                if (ready) ImGui::TextColored(hex(palette::Green), "Ready");
+                                else       ImGui::TextColored(hex(palette::Gold), "Building");
                             }
                             ImGui::EndTable();
                         }
@@ -1911,7 +1797,7 @@ void UI::drawDataOutput() {
                 ImGui::Spacing();
 
                 // Export path with browse button
-                ImGui::TextColored(hex(0x8B7D6B), "Export Path");
+                ImGui::TextColored(hex(palette::TextMuted), "Export Path");
                 char pathBuf[512];
                 strncpy(pathBuf, exportPath.c_str(), sizeof(pathBuf));
                 pathBuf[sizeof(pathBuf) - 1] = '\0';
@@ -1927,32 +1813,51 @@ void UI::drawDataOutput() {
 
                 ImGui::Spacing();
 
-                // Frame range (V1: exports current frame only, range stored for future use)
-                ImGui::TextColored(hex(0x8B7D6B), "Frame Range");
-                ImGui::SetNextItemWidth(100);
-                ImGui::InputInt("Start", &exportFrameStart);
+                // Sim frame readout — file names use this number
+                ImGui::TextColored(hex(palette::TextMuted), "Sim Frame");
                 ImGui::SameLine();
-                ImGui::SetNextItemWidth(100);
-                ImGui::InputInt("End", &exportFrameEnd);
-                if (exportFrameStart < 0) exportFrameStart = 0;
-                if (exportFrameEnd < exportFrameStart) exportFrameEnd = exportFrameStart;
+                ImGui::TextColored(hex(palette::Text), "%llu", static_cast<unsigned long long>(simFrame));
+                ImGui::TextColored(hex(palette::TextDim), "  Frames = compute steps since Restart (0 = init state).");
+                ImGui::TextColored(hex(palette::TextDim), "  Recording writes one CSV per sim frame: name_0042.csv, ...");
+                ImGui::TextColored(hex(palette::TextDim), "  Pause pauses the recording; Step captures single frames.");
 
                 ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::Spacing();
 
-                // CSV export button
-                if (ImGui::Button("Export CSV", ImVec2(120, 0))) {
+                // Prompt for a path if none is set; returns false if the user cancels
+                auto ensureExportPath = [&]() -> bool {
                     if (exportPath.empty()) {
-                        // No path set — open dialog
                         std::string path = saveFileDialog("CSV File (*.csv)\0*.csv\0", "Export Particles");
-                        if (!path.empty()) {
-                            exportPath = path;
-                            if (onExportCSV) onExportCSV(exportPath);
-                        }
-                    } else {
-                        if (onExportCSV) onExportCSV(exportPath);
+                        if (path.empty()) return false;
+                        exportPath = path;
                     }
+                    return true;
+                };
+
+                if (ImGui::Button("Export Current Frame", ImVec2(160, 0))) {
+                    if (ensureExportPath() && onExportCSV) onExportCSV(exportPath);
+                }
+                ImGui::SameLine();
+
+                if (!recordingActive) {
+                    if (ImGui::Button("Start Recording", ImVec2(140, 0))) {
+                        if (ensureExportPath()) {
+                            recordedFrames = 0;
+                            recordingActive = true;
+                        }
+                    }
+                } else {
+                    // Red stop button + live counter — recording state is always visible
+                    ImGui::PushStyleColor(ImGuiCol_Button,        hex(palette::RedDark));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hex(palette::Red));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  hex(palette::RedDarker));
+                    if (ImGui::Button("Stop Recording", ImVec2(140, 0))) {
+                        recordingActive = false;
+                    }
+                    ImGui::PopStyleColor(3);
+                    ImGui::SameLine();
+                    ImGui::TextColored(hex(palette::Red), "Recording — %u frame(s) captured", recordedFrames);
                 }
 
                 ImGui::EndTabItem();
@@ -1977,57 +1882,43 @@ void UI::drawPreferences() {
 
         // ── Rendering ──
         if (ImGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::TextColored(hex(0x8B7D6B), "Resolution");
+            ImGui::TextColored(hex(palette::TextMuted), "Resolution");
             ImGui::SameLine(160);
             ImGui::SetNextItemWidth(80);
             if (ImGui::InputInt("##res_w", &renderWidth, 0, 0)) renderResDirty = true;
             ImGui::SameLine();
-            ImGui::TextColored(hex(0x5C5347), "x");
+            ImGui::TextColored(hex(palette::TextDim), "x");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(80);
             if (ImGui::InputInt("##res_h", &renderHeight, 0, 0)) renderResDirty = true;
             renderWidth = std::clamp(renderWidth, 320, 7680);
             renderHeight = std::clamp(renderHeight, 240, 4320);
-            ImGui::TextColored(hex(0x5C5347), "  Offscreen framebuffer size. Affects GPU load.");
-        }
-
-        ImGui::Spacing();
-
-        // ── Particle Simulation ──
-        if (ImGui::CollapsingHeader("Particle Simulation", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::TextColored(hex(0x8B7D6B), "Particle Count");
-            ImGui::SameLine(160);
-            ImGui::SetNextItemWidth(-1);
-            int prev = particleCount;
-            ImGui::InputInt("##particle_count", &particleCount, 1000, 10000);
-            particleCount = std::clamp(particleCount, 100, 1000000);
-            if (particleCount != prev) particleCountDirty = true;
-            ImGui::TextColored(hex(0x5C5347), "  Max particles in the SSBO. Init shader fills up to this count.");
+            ImGui::TextColored(hex(palette::TextDim), "  Offscreen framebuffer size. Affects GPU load.");
         }
 
         ImGui::Spacing();
 
         // ── Mesh Rendering ──
         if (ImGui::CollapsingHeader("Mesh Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::TextColored(hex(0x8B7D6B), "Default Shader");
+            ImGui::TextColored(hex(palette::TextMuted), "Default Shader");
             ImGui::SameLine(160);
-            ImGui::TextColored(hex(0x5C5347), "Unlit (engine default)");
+            ImGui::TextColored(hex(palette::TextDim), "Unlit (engine default)");
 
             ImGui::Spacing();
-            ImGui::TextColored(hex(0x5C5347), "  Per-mesh shader overrides in Inspector > Shaders.");
-            ImGui::TextColored(hex(0x5C5347), "  PBR / shadow settings coming in V2.");
+            ImGui::TextColored(hex(palette::TextDim), "  Per-mesh shader overrides in Inspector > Shaders.");
+            ImGui::TextColored(hex(palette::TextDim), "  PBR / shadow settings coming in V2.");
         }
 
         ImGui::Spacing();
 
         // ── Camera ──
         if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::TextColored(hex(0x8B7D6B), "Move Speed");
+            ImGui::TextColored(hex(palette::TextMuted), "Move Speed");
             ImGui::SameLine(160);
             ImGui::SetNextItemWidth(-1);
             ImGui::SliderFloat("##cam_speed", &cameraMoveSpeed, 0.5f, 50.0f, "%.1f");
 
-            ImGui::TextColored(hex(0x8B7D6B), "Look Sensitivity");
+            ImGui::TextColored(hex(palette::TextMuted), "Look Sensitivity");
             ImGui::SameLine(160);
             ImGui::SetNextItemWidth(-1);
             ImGui::SliderFloat("##cam_sens", &cameraLookSensitivity, 0.01f, 0.5f, "%.2f");
@@ -2037,18 +1928,18 @@ void UI::drawPreferences() {
 
         // ── Viewport ──
         if (ImGui::CollapsingHeader("Viewport", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::TextColored(hex(0x8B7D6B), "Light Gizmos");
+            ImGui::TextColored(hex(palette::TextMuted), "Light Gizmos");
             ImGui::SameLine(160);
             ImGui::Checkbox("##show_gizmos", &showGizmos);
             ImGui::SameLine();
-            ImGui::TextColored(hex(0x5C5347), "Show light position/direction in viewport");
+            ImGui::TextColored(hex(palette::TextDim), "Show light position/direction in viewport");
         }
 
         ImGui::Spacing();
 
         // ── Data ──
         if (ImGui::CollapsingHeader("Data Output", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::TextColored(hex(0x8B7D6B), "Refresh Interval");
+            ImGui::TextColored(hex(palette::TextMuted), "Refresh Interval");
             ImGui::SameLine(160);
             ImGui::SetNextItemWidth(-1);
             ImGui::SliderFloat("##data_refresh", &dataRefreshInterval, 0.1f, 5.0f, "%.1f s");

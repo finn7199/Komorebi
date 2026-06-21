@@ -37,9 +37,8 @@ std::string MeshCache::load(const std::string& filePath, BufferManager& buffers)
 }
 
 void MeshCache::loadPrimitives(BufferManager& buffers) {
-    uploadToGPU("__primitive_cube", generateCube(), buffers);
-    uploadToGPU("__primitive_sphere", generateSphere(), buffers);
-    uploadToGPU("__primitive_plane", generatePlane(), buffers);
+    uploadToGPU(PRIMITIVE_CUBE, generateCube(), buffers);
+    uploadToGPU(PRIMITIVE_SPHERE, generateSphere(), buffers);
 }
 
 const GPUMesh& MeshCache::get(const std::string& key) const {
@@ -201,24 +200,11 @@ MeshData MeshCache::generateSphere(int segments, int rings) {
             uint32_t tr = tl + 1;
             uint32_t bl = tl + (segments + 1);
             uint32_t br = bl + 1;
-            data.indices.insert(data.indices.end(), { tl, bl, tr, tr, bl, br });
+            // CCW-outward winding (matches the cube and the pipeline's
+            // frontFace = eCounterClockwise); otherwise front faces get back-face culled.
+            data.indices.insert(data.indices.end(), { tl, tr, bl, tr, br, bl });
         }
     }
-
-    return data;
-}
-
-MeshData MeshCache::generatePlane() {
-    MeshData data;
-    glm::vec3 normal = { 0, 1, 0 };
-
-    data.vertices = {
-        {{ -0.5f, 0, -0.5f }, normal, { 0, 0 }},
-        {{  0.5f, 0, -0.5f }, normal, { 1, 0 }},
-        {{  0.5f, 0,  0.5f }, normal, { 1, 1 }},
-        {{ -0.5f, 0,  0.5f }, normal, { 0, 1 }},
-    };
-    data.indices = { 0, 1, 2, 0, 2, 3 };
 
     return data;
 }
