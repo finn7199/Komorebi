@@ -110,6 +110,9 @@ void main() {
         result += (diff * baseColor + specMask * interference * 15.0) * light.color * light.atten;
     }
 
-    result   = pow(result, vec3(1.0 / 2.2)); // gamma correct
+    // Output LINEAR color: the offscreen render target is an _SRGB image, so the
+    // GPU applies the linear→sRGB encode automatically on write. Encoding it here
+    // too would gamma-correct twice (washed-out, milky look). Matches mesh_pbr.frag.
+    // result   = pow(result, vec3(1.0 / 2.2)); // (was) manual gamma — double-corrected, disabled
     outColor = vec4(result, push.color.a);
 }
