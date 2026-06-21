@@ -2,11 +2,8 @@
 
 Komorebi is a real-time 3D rendering and particle simulation editor built from scratch in C++ and Vulkan. Load 3D models, write shaders, and tweak parameters live.
 
-<img src="media/render.gif" alt="3D Rendering"/><br/>
-<em>3D rendering of thin film interference</em>
-
-<img src="media/particle.gif" alt="GPU Particle Simulation"/><br/>
-<em>GPU particle simulation - gravity with bounciness</em>
+<img src="media/kmrb.gif" alt="Animated 3D Cube"/><br/>
+<em>An animated, spinning 3D cube with a colorful thin film effect</em>
 
 <img src="media/hdr_map.jpg" alt="HDR Environment Map"/><br/>
 <em>HDR environment map - 0.5 metallic</em>
